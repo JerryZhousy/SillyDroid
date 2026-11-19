@@ -1,0 +1,308 @@
+{
+  "schemaVersion": 1,
+  "setId": "shalistera-sillytavern-1.19.0",
+  "baseTag": "1.19.0",
+  "sourceRepo": "shalistera/sillytavern",
+  "sourceRef": "release",
+  "sourceHead": "f67e000034a130dc25c7fb7571b5731f4c219f89",
+  "upstreamBase": "06bde939fb1e9c4c8d8641d810f0a916b5bce127",
+  "patchCount": 31,
+  "seriesSha256": "fb0eb2928d9212ec5b7ac3d8b730d8902bfa4f305d6fecc82dcb347c614d73e5",
+  "groups": {
+    "docs": 3,
+    "feature": 2,
+    "fix": 8,
+    "perf": 18
+  },
+  "groupMembers": {
+    "docs": [
+      "Document native model controls and reproducible",
+      "Document measured performance improvements and",
+      "Document measured browser and server performance"
+    ],
+    "feature": [
+      "Integrate native Vertex streaming, continuation, and",
+      "Support native custom model IDs across chat and text"
+    ],
+    "fix": [
+      "Avoid stale chat searches and duplicate rendering work",
+      "Prevent repeated reasoning edits from corrupting saved",
+      "Keep one avatar fallback listener when reusing message",
+      "Avoid quadratic span expansion and repeated work in",
+      "Release media load listeners after completion,",
+      "Preserve indexed span semantics for extension-provided",
+      "Settle failed token count requests using the existing",
+      "Preserve pending stream content across tools, failures,"
+    ],
+    "perf": [
+      "Reduce native streaming and chat rendering overhead",
+      "Optimize reasoning Markdown, world info scans, and chat",
+      "Cache chat summaries and preserve imported histories",
+      "Reduce chat scan decoding and reuse filename search",
+      "Promote persisted character metadata into the bounded",
+      "Reduce repeated tag selection and keyboard",
+      "Reuse unchanged reasoning and body rendering in",
+      "Use linear membership checks for world info and persona",
+      "Index closed folders when filtering character and group",
+      "Index group chat references and reuse stats within each",
+      "Reuse frontend library builds across unrelated source",
+      "Skip unused macro parsing for plain text while",
+      "Read only image headers when probing thumbnail",
+      "Reduce hidden streaming previews and safely replace",
+      "Load independent startup message templates concurrently",
+      "Load and persist token counts per chat with bounded",
+      "Share pending tokenizer initialization and retry failed",
+      "Distinguish streaming CPU measurements from scheduling"
+    ]
+  },
+  "patches": [
+    {
+      "file": "0001-Integrate-native-Vertex-streaming-continuation-and-d.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Integrate native Vertex streaming, continuation, and",
+      "group": "feature",
+      "bytes": 125955,
+      "sha256": "047e1857fa133a3f8cec186733187732aa14d84bdc18a0870a4696bab2983576"
+    },
+    {
+      "file": "0002-Reduce-native-streaming-and-chat-rendering-overhead.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Reduce native streaming and chat rendering overhead",
+      "group": "perf",
+      "bytes": 10595,
+      "sha256": "868dcddf5760a45024509e762651748e80b9026d133446e2406c5ca7e4a2e76b"
+    },
+    {
+      "file": "0003-Optimize-reasoning-Markdown-world-info-scans-and-cha.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Optimize reasoning Markdown, world info scans, and chat",
+      "group": "perf",
+      "bytes": 39559,
+      "sha256": "fd7147f84fc8a4782f8a8f19f18ab3e0afb14835325cb4a099e383c82dfbc46f"
+    },
+    {
+      "file": "0004-Cache-chat-summaries-and-preserve-imported-histories.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Cache chat summaries and preserve imported histories",
+      "group": "perf",
+      "bytes": 35336,
+      "sha256": "8823ea2f011ae9b199da962015b46e29f54c3bc1949075ecd9b2024319a2e6e0"
+    },
+    {
+      "file": "0005-Avoid-stale-chat-searches-and-duplicate-rendering-wo.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Avoid stale chat searches and duplicate rendering work",
+      "group": "fix",
+      "bytes": 35396,
+      "sha256": "2ca1948da7c3e5ccbc5d6262a7ebe7dfaf2090e1b07af788c3378b1527e78473"
+    },
+    {
+      "file": "0006-Prevent-repeated-reasoning-edits-from-corrupting-sav.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Prevent repeated reasoning edits from corrupting saved",
+      "group": "fix",
+      "bytes": 8180,
+      "sha256": "189f2aba1b87646c0a3706037fc4e83c7ffaef055c164b20495a7f167449914b"
+    },
+    {
+      "file": "0007-Document-native-model-controls-and-reproducible-perf.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Document native model controls and reproducible",
+      "group": "docs",
+      "bytes": 13984,
+      "sha256": "a17b41e7b0c7b7ae802c78b6edc9ed21bca3aa74be8c155edb34b0d60efafb79"
+    },
+    {
+      "file": "0008-Support-native-custom-model-IDs-across-chat-and-text.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Support native custom model IDs across chat and text",
+      "group": "feature",
+      "bytes": 118137,
+      "sha256": "4dd43d537aeeab07174e608b92ba4777ec802a510dbfc412cca2ccf569c7a05f"
+    },
+    {
+      "file": "0009-Reduce-chat-scan-decoding-and-reuse-filename-search-.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Reduce chat scan decoding and reuse filename search",
+      "group": "perf",
+      "bytes": 31760,
+      "sha256": "ed51ff65f078ea4cb917fa510ee144f1d7d6c5d062376dea2f936b5ee7fb55ac"
+    },
+    {
+      "file": "0010-Promote-persisted-character-metadata-into-the-bounde.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Promote persisted character metadata into the bounded",
+      "group": "perf",
+      "bytes": 16750,
+      "sha256": "7f23b3aa923438b996353a7cadf7116a2539e65eeded14998b5ef91f58974d4b"
+    },
+    {
+      "file": "0011-Reduce-repeated-tag-selection-and-keyboard-initializ.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Reduce repeated tag selection and keyboard",
+      "group": "perf",
+      "bytes": 24621,
+      "sha256": "dd4b60dd405465ba941157431b9178e30aae406b5a1eba6ff04cb51c9c78b871"
+    },
+    {
+      "file": "0012-Keep-one-avatar-fallback-listener-when-reusing-messa.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Keep one avatar fallback listener when reusing message",
+      "group": "fix",
+      "bytes": 4408,
+      "sha256": "c328025112c4af48ab01035f452ab2bef025e5cff7851905ba55da1c2504229b"
+    },
+    {
+      "file": "0013-Avoid-quadratic-span-expansion-and-repeated-work-in-.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Avoid quadratic span expansion and repeated work in",
+      "group": "fix",
+      "bytes": 32337,
+      "sha256": "68ed91cc02a2c2eb08e0b1ea93880d9e4181ace507852d94a5dda9dadb5f2f39"
+    },
+    {
+      "file": "0014-Reuse-unchanged-reasoning-and-body-rendering-in-stre.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Reuse unchanged reasoning and body rendering in",
+      "group": "perf",
+      "bytes": 10493,
+      "sha256": "5b9aa7daaf2ac468ac92db92b5e04043cbee9326a9fc4f41f4b962f42e566307"
+    },
+    {
+      "file": "0015-Release-media-load-listeners-after-completion-cancel.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Release media load listeners after completion,",
+      "group": "fix",
+      "bytes": 12694,
+      "sha256": "b78882198cb5ec6d99e38528f250554d56c8931318cc6c167def786dcf96d8ac"
+    },
+    {
+      "file": "0016-Document-measured-performance-improvements-and-cache.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Document measured performance improvements and",
+      "group": "docs",
+      "bytes": 11779,
+      "sha256": "eb949d41aac0db7592c615fd076f1bb9303197c652ca76836dd3358f2da26756"
+    },
+    {
+      "file": "0017-Preserve-indexed-span-semantics-for-extension-provid.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Preserve indexed span semantics for extension-provided",
+      "group": "fix",
+      "bytes": 3159,
+      "sha256": "f83449f7f5e26a16a4c4be256d1c2724935bd425c4c605cfcf9700e362dbe028"
+    },
+    {
+      "file": "0018-Use-linear-membership-checks-for-world-info-and-pers.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Use linear membership checks for world info and persona",
+      "group": "perf",
+      "bytes": 16680,
+      "sha256": "7639f707046de809dbf91038a207faa4b186589cd808e0844a58c001190f6653"
+    },
+    {
+      "file": "0019-Index-closed-folders-when-filtering-character-and-gr.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Index closed folders when filtering character and group",
+      "group": "perf",
+      "bytes": 18393,
+      "sha256": "7f019ea5fded12df6abf5326df8823e52f5369c6d8fdf523baae6560fd589d99"
+    },
+    {
+      "file": "0020-Index-group-chat-references-and-reuse-stats-within-e.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Index group chat references and reuse stats within each",
+      "group": "perf",
+      "bytes": 21399,
+      "sha256": "f7366e33ac56887181e858d9760593ce2f78b401692e038801932317953f0747"
+    },
+    {
+      "file": "0021-Reuse-frontend-library-builds-across-unrelated-sourc.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Reuse frontend library builds across unrelated source",
+      "group": "perf",
+      "bytes": 15312,
+      "sha256": "390ceceb3c11aee5a2628b9d61786792eda6459a49dcba33cf72b91dd20fc61d"
+    },
+    {
+      "file": "0022-Skip-unused-macro-parsing-for-plain-text-while-prese.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Skip unused macro parsing for plain text while",
+      "group": "perf",
+      "bytes": 18040,
+      "sha256": "ee520d37274f4996eb1279c5275e455e9f44b02c32188d9d5156111387c7f2a2"
+    },
+    {
+      "file": "0023-Settle-failed-token-count-requests-using-the-existin.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Settle failed token count requests using the existing",
+      "group": "fix",
+      "bytes": 10652,
+      "sha256": "1e5eaf571c7400faae80c7b7369d00fb77979c628f206489595166651743f708"
+    },
+    {
+      "file": "0024-Read-only-image-headers-when-probing-thumbnail-anima.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Read only image headers when probing thumbnail",
+      "group": "perf",
+      "bytes": 26776,
+      "sha256": "efcac1c15813ff250da606d16734bc8960942fde2274bf1f40389bf3dbf537c1"
+    },
+    {
+      "file": "0025-Reduce-hidden-streaming-previews-and-safely-replace-.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Reduce hidden streaming previews and safely replace",
+      "group": "perf",
+      "bytes": 25908,
+      "sha256": "63a60a4a6e1bbcef8fb8291d4ef008a311a033528d8c3540dfbdb532e035696d"
+    },
+    {
+      "file": "0026-Load-independent-startup-message-templates-concurren.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Load independent startup message templates concurrently",
+      "group": "perf",
+      "bytes": 15029,
+      "sha256": "cb2623ead086199cb414a90ba81cb1bfb9aec4b324d866b17242d0ae6a8ddfb3"
+    },
+    {
+      "file": "0027-Load-and-persist-token-counts-per-chat-with-bounded-.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Load and persist token counts per chat with bounded",
+      "group": "perf",
+      "bytes": 45839,
+      "sha256": "1a9bd4e7d6523cf6ad1c962994fa288be9e9088fe82ede9a5300b623cb17d3fd"
+    },
+    {
+      "file": "0028-Share-pending-tokenizer-initialization-and-retry-fai.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Share pending tokenizer initialization and retry failed",
+      "group": "perf",
+      "bytes": 17549,
+      "sha256": "54720e5822bc28fe25caa06b625aa469da2ad76c03651b6aa22a1bee368bdf7c"
+    },
+    {
+      "file": "0029-Document-measured-browser-and-server-performance-imp.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Document measured browser and server performance",
+      "group": "docs",
+      "bytes": 12322,
+      "sha256": "bbba8bec989baa7b9f8b196c8ba901dce72d39512201ea75e5ee61443c3c998c"
+    },
+    {
+      "file": "0030-Preserve-pending-stream-content-across-tools-failure.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Preserve pending stream content across tools, failures,",
+      "group": "fix",
+      "bytes": 33426,
+      "sha256": "cca6a608f9d156f48de46d20521f1a1114ff7dab381b18c80db72f2bcc54c4b0"
+    },
+    {
+      "file": "0031-Distinguish-streaming-CPU-measurements-from-scheduli.patch",
+      "sha": "0000000000000000000000000000000000000000",
+      "subject": "Distinguish streaming CPU measurements from scheduling",
+      "group": "perf",
+      "bytes": 8235,
+      "sha256": "d66d671d253db36d706f0fe4bdd4f018f5a4058b9a4d4ca19cbb3fdcebf34cd6"
+    }
+  ]
+}

@@ -1,0 +1,413 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Thu, 22 Oct 2026 20:41:03 +0900
+Subject: [PATCH 20/31] Index group chat references and reuse stats within each
+ list request
+
+---
+ src/endpoints/groups.js           |  24 +++--
+ tests/bench-group-list.mjs        | 139 +++++++++++++++++++++++++++
+ tests/group-list.node.mjs         | 151 ++++++++++++++++++++++++++++++
+ tests/util/group-list-fixture.mjs |  46 +++++++++
+ 4 files changed, 354 insertions(+), 6 deletions(-)
+ create mode 100644 tests/bench-group-list.mjs
+ create mode 100644 tests/group-list.node.mjs
+ create mode 100644 tests/util/group-list-fixture.mjs
+
+diff --git a/src/endpoints/groups.js b/src/endpoints/groups.js
+index 68094f9f..f46124cb 100644
+--- a/src/endpoints/groups.js
++++ b/src/endpoints/groups.js
+@@ -119,6 +119,12 @@ router.post('/all', (request, response) => {
+ 
+     const files = fs.readdirSync(request.user.directories.groups).filter(x => path.extname(x) === '.json');
+     const chats = fs.readdirSync(request.user.directories.groupChats).filter(x => path.extname(x) === '.jsonl');
++    // Match each group's references directly instead of scanning the entire
++    // chat directory again for every group. Keep the directory order for stats.
++    const chatsById = new Map(chats.map((file, index) => [path.parse(file).name, { file, index }]));
++    // A chat can belong to multiple groups. Share successful stats only within
++    // this request; the next list request must observe edits and deleted files.
++    const chatStats = new Map();
+ 
+     files.forEach(function (file) {
+         try {
+@@ -132,13 +138,19 @@ router.post('/all', (request, response) => {
+             let chat_size = 0;
+             let date_last_chat = 0;
+ 
+-            if (Array.isArray(group.chats) && Array.isArray(chats)) {
+-                for (const chat of chats) {
+-                    if (group.chats.includes(path.parse(chat).name)) {
+-                        const chatStat = fs.statSync(path.join(request.user.directories.groupChats, chat));
+-                        chat_size += chatStat.size;
+-                        date_last_chat = Math.max(date_last_chat, chatStat.mtimeMs);
++            if (Array.isArray(group.chats)) {
++                const matchingChats = [...new Set(group.chats)]
++                    .map(id => chatsById.get(id))
++                    .filter(Boolean)
++                    .sort((a, b) => a.index - b.index);
++                for (const { file: chat } of matchingChats) {
++                    let chatStat = chatStats.get(chat);
++                    if (!chatStat) {
++                        chatStat = fs.statSync(path.join(request.user.directories.groupChats, chat));
++                        chatStats.set(chat, chatStat);
+                     }
++                    chat_size += chatStat.size;
++                    date_last_chat = Math.max(date_last_chat, chatStat.mtimeMs);
+                 }
+             }
+ 
+diff --git a/tests/bench-group-list.mjs b/tests/bench-group-list.mjs
+new file mode 100644
+index 00000000..abd14212
+--- /dev/null
++++ b/tests/bench-group-list.mjs
+@@ -0,0 +1,139 @@
++// Compare the real group-list HTTP route using temporary synthetic groups.
++// Neither a running SillyTavern instance nor a provider connection is needed.
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++import { execFileSync } from 'node:child_process';
++import { performance } from 'node:perf_hooks';
++import { parseArgs } from 'node:util';
++import { fileURLToPath } from 'node:url';
++import { setConfigFilePath } from '../src/util.js';
++import { createGroupListFixture, serveGroupRouter } from './util/group-list-fixture.mjs';
++
++const { values } = parseArgs({ options: {
++    baseline: { type: 'string', default: 'bebe62bda' },
++    rounds: { type: 'string', default: '5' },
++    groups: { type: 'string', default: '200' },
++    'chats-per-group': { type: 'string', default: '20' },
++    'shared-chats': { type: 'string', default: '0' },
++    help: { type: 'boolean', short: 'h' },
++} });
++if (values.help) {
++    console.log('Usage: node tests/bench-group-list.mjs [--baseline REF] [--rounds N] [--groups N] [--chats-per-group N] [--shared-chats N]\n'
++        + 'Defaults: --baseline bebe62bda --rounds 5 --groups 200 --chats-per-group 20 --shared-chats 0\n'
++        + 'Each group has its own chats plus any shared chats. Both versions return identical HTTP JSON.\n'
++        + 'Reports wall time, process CPU, path parsing and filesystem calls. Temporary fixtures are removed.\n'
++        + 'Uses current supporting modules and dependencies for both endpoint versions.');
++    process.exit(0);
++}
++const rounds = Number(values.rounds);
++const groups = Number(values.groups);
++const chatsPerGroup = Number(values['chats-per-group']);
++const sharedChats = Number(values['shared-chats']);
++if (![rounds, groups].every(value => Number.isSafeInteger(value) && value > 0)
++    || ![chatsPerGroup, sharedChats].every(value => Number.isSafeInteger(value) && value >= 0)) {
++    throw new Error('Rounds and groups must be positive integers; chat counts must be nonnegative integers.');
++}
++setConfigFilePath(fileURLToPath(new URL('../default/config.yaml', import.meta.url)));
++const endpoint = new URL('../src/endpoints/groups.js', import.meta.url);
++const gitOptions = { cwd: fileURLToPath(new URL('../', import.meta.url)), encoding: 'utf8' };
++const commit = execFileSync('git', ['rev-parse', '--verify', '--end-of-options', `${values.baseline}^{commit}`], gitOptions).trim();
++const source = execFileSync('git', ['show', `${commit}:src/endpoints/groups.js`], gitOptions);
++const resolvedSource = source.replace(/\bfrom\s+(['"])([^'"\r\n]+)\1(?=\s*;)/g, (_, quote, specifier) => {
++    const resolved = specifier.startsWith('.') || specifier.startsWith('/')
++        ? new URL(specifier, endpoint).href : import.meta.resolve(specifier);
++    return `from '${resolved}'`;
++});
++const implementations = {
++    baseline: await import('data:text/javascript;base64,' + Buffer.from(resolvedSource).toString('base64')),
++    current: await import(endpoint.href),
++};
++const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'st-bench-group-list-'));
++const original = { parse: path.parse, statSync: fs.statSync, readFileSync: fs.readFileSync };
++const servers = {};
++let counters;
++
++try {
++    const directories = await createGroupListFixture(root, { groups, chatsPerGroup, sharedChats });
++    for (const [name, implementation] of Object.entries(implementations)) {
++        servers[name] = await serveGroupRouter(implementation.router, directories);
++    }
++    const samples = [];
++    let expected;
++    for (let round = 0; round < rounds; round++) {
++        const order = round % 2 ? ['current', 'baseline'] : ['baseline', 'current'];
++        const sample = { round: round + 1, order };
++        for (const name of order) {
++            const cpuStart = process.cpuUsage();
++            const start = performance.now();
++            const result = await servers[name].request();
++            const durationMs = performance.now() - start;
++            const cpu = process.cpuUsage(cpuStart);
++            sample[name] = { durationMs: rounded(durationMs), cpuMs: rounded((cpu.user + cpu.system) / 1000) };
++            assert.equal(result.length, groups);
++            if (expected) assert.deepEqual(result, expected);
++            else expected = result;
++        }
++        samples.push(sample);
++    }
++    // Instrumentation inside a hot path can distort its timing. Collect the
++    // operation counts in separate requests after every timed round completes.
++    path.parse = function (file) {
++        if (counters && file.endsWith('.jsonl')) counters.chatPathParses++;
++        return original.parse.call(this, file);
++    };
++    fs.statSync = function (file, ...args) {
++        if (counters) {
++            if (String(file).startsWith(directories.groupChats + path.sep)) counters.chatStats++;
++            if (String(file).startsWith(directories.groups + path.sep)) counters.groupStats++;
++        }
++        return original.statSync.call(this, file, ...args);
++    };
++    fs.readFileSync = function (file, ...args) {
++        const result = original.readFileSync.call(this, file, ...args);
++        if (counters && String(file).startsWith(directories.groups + path.sep)) {
++            counters.groupReads++;
++            counters.groupBytesRead += Buffer.byteLength(result);
++        }
++        return result;
++    };
++    const operationCounts = {};
++    for (const name of Object.keys(implementations)) {
++        counters = { chatPathParses: 0, chatStats: 0, groupStats: 0, groupReads: 0, groupBytesRead: 0 };
++        assert.deepEqual(await servers[name].request(), expected);
++        operationCounts[name] = counters;
++        counters = undefined;
++    }
++    const summary = {};
++    for (const name of Object.keys(implementations)) {
++        const items = samples.map(sample => sample[name]);
++        summary[name] = {
++            medianMs: median(items.map(item => item.durationMs)),
++            medianCpuMs: median(items.map(item => item.cpuMs)),
++            minMs: Math.min(...items.map(item => item.durationMs)),
++            maxMs: Math.max(...items.map(item => item.durationMs)),
++            operationCounts: operationCounts[name],
++        };
++    }
++    console.log(JSON.stringify({ baseline: { ref: values.baseline, commit }, groups, chatsPerGroup, sharedChats,
++        uniqueChatFiles: groups * chatsPerGroup + sharedChats, rounds, summary, samples,
++        note: 'Real localhost HTTP responses include JSON serialization and parsing. Every request rereads group JSON and obtains fresh stats; no cross-request cache is used. Operation counts are collected separately after all uninstrumented timed rounds. OS disk cache is not cleared; timings vary with machine load.',
++    }, null, 2));
++} finally {
++    path.parse = original.parse;
++    fs.statSync = original.statSync;
++    fs.readFileSync = original.readFileSync;
++    for (const server of Object.values(servers)) await server.close();
++    await fs.promises.rm(root, { recursive: true, force: true });
++}
++
++function rounded(value) {
++    return +value.toFixed(2);
++}
++
++function median(items) {
++    const sorted = [...items].sort((a, b) => a - b);
++    const middle = Math.floor(sorted.length / 2);
++    return rounded(sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2);
++}
+diff --git a/tests/group-list.node.mjs b/tests/group-list.node.mjs
+new file mode 100644
+index 00000000..ba901c1f
+--- /dev/null
++++ b/tests/group-list.node.mjs
+@@ -0,0 +1,151 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++import fs from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++import { router } from '../src/endpoints/groups.js';
++import { createGroupListFixture, serveGroupRouter } from './util/group-list-fixture.mjs';
++
++async function setup(t, options) {
++    const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'st-group-list-'));
++    const directories = await createGroupListFixture(root, options);
++    const server = await serveGroupRouter(router, directories);
++    t.after(async () => {
++        await server.close();
++        await fs.promises.rm(root, { recursive: true, force: true });
++    });
++    return { root, directories, server };
++}
++
++// Retain the original directory-order membership algorithm as a compatibility
++// oracle. The optimized route must produce the same public JSON response.
++function referenceGroups(directories) {
++    const chats = fs.readdirSync(directories.groupChats).filter(file => path.extname(file) === '.jsonl');
++    return fs.readdirSync(directories.groups).filter(file => path.extname(file) === '.json').map(file => {
++        const filePath = path.join(directories.groups, file);
++        const group = JSON.parse(fs.readFileSync(filePath, 'utf8'));
++        const stat = fs.statSync(filePath);
++        group.date_added = stat.birthtimeMs;
++        group.create_date = new Date(stat.birthtimeMs).toISOString();
++        group.chat_size = 0;
++        group.date_last_chat = 0;
++        if (Array.isArray(group.chats)) {
++            for (const chat of chats) {
++                if (group.chats.includes(path.parse(chat).name)) {
++                    const chatStat = fs.statSync(path.join(directories.groupChats, chat));
++                    group.chat_size += chatStat.size;
++                    group.date_last_chat = Math.max(group.date_last_chat, chatStat.mtimeMs);
++                }
++            }
++        }
++        return group;
++    });
++}
++
++async function writeGroup(directories, id, chats) {
++    await fs.promises.writeFile(path.join(directories.groups, `${id}.json`), JSON.stringify({ id, name: id, chats }));
++}
++
++test('HTTP groups preserve directory order, strict IDs, extensions and duplicate-reference semantics', async t => {
++    const { directories, server } = await setup(t);
++    for (const name of ['a.jsonl', 'story.v1.jsonl', 'story.v1.JSONL', 'story.v1.jsonl.bak', '__proto__.jsonl', '.hidden.jsonl', '.jsonl', 'name.jsonl.jsonl', '1.jsonl']) {
++        await fs.promises.writeFile(path.join(directories.groupChats, name), `Contents of ${name}`);
++    }
++    // The old route includes matching directory entries too; do not silently
++    // narrow it to regular files during the indexing optimization.
++    await fs.promises.mkdir(path.join(directories.groupChats, 'directory.jsonl'));
++    await writeGroup(directories, 'z-last', ['story.v1', 'a', 'a', 'missing', '__proto__', '.hidden', '', 'name.jsonl', 1, null, {}, ['a'], 'directory']);
++    await writeGroup(directories, 'a-first', ['1', 'a', 'story.v1.jsonl.bak']);
++    await writeGroup(directories, 'no-array', 'a');
++    const readDirectory = fs.readdirSync;
++    t.mock.method(fs, 'readdirSync', (directory, ...args) => {
++        const entries = readDirectory(directory, ...args);
++        return directory === directories.groups || directory === directories.groupChats ? entries.reverse() : entries;
++    });
++    const stat = fs.statSync;
++    const statOrder = [];
++    t.mock.method(fs, 'statSync', (file, ...args) => {
++        if (String(file).startsWith(directories.groupChats + path.sep)) statOrder.push(path.basename(file));
++        return stat(file, ...args);
++    });
++    const expected = referenceGroups(directories);
++    const expectedStats = [...new Set(statOrder)];
++    statOrder.length = 0;
++    assert.deepEqual(await server.request(), expected);
++    assert.deepEqual(statOrder, expectedStats);
++});
++
++test('shared group chats are statted once per HTTP request, and never retained between requests', async t => {
++    const { directories, server } = await setup(t, { groups: 4, chatsPerGroup: 2, sharedChats: 3 });
++    const expected = referenceGroups(directories);
++    const stat = fs.statSync;
++    let chatStats = 0;
++    t.mock.method(fs, 'statSync', (file, ...args) => {
++        if (String(file).startsWith(directories.groupChats + path.sep)) chatStats++;
++        return stat(file, ...args);
++    });
++    assert.deepEqual(await server.request(), expected);
++    assert.equal(chatStats, 11);
++    assert.deepEqual(await server.request(), expected);
++    assert.equal(chatStats, 22);
++});
++
++test('edits, additions, rename and deletion are visible in the next group list', async t => {
++    const { directories, server } = await setup(t, { groups: 2, sharedChats: 1 });
++    await server.request();
++    const chat = path.join(directories.groupChats, 'shared-0.jsonl');
++    const originalStat = await fs.promises.stat(chat);
++    await fs.promises.writeFile(chat, 'changed contents with a different size');
++    await fs.promises.utimes(chat, originalStat.atime, originalStat.mtime);
++    assert.deepEqual(await server.request(), referenceGroups(directories));
++    await fs.promises.rename(chat, path.join(directories.groupChats, 'renamed.jsonl'));
++    await writeGroup(directories, 'group-00000', ['renamed', 'new']);
++    await fs.promises.writeFile(path.join(directories.groupChats, 'new.jsonl'), 'new chat');
++    assert.deepEqual(await server.request(), referenceGroups(directories));
++    await fs.promises.unlink(path.join(directories.groupChats, 'renamed.jsonl'));
++    await fs.promises.unlink(path.join(directories.groupChats, 'new.jsonl'));
++    const empty = await server.request();
++    assert.deepEqual(empty, referenceGroups(directories));
++    assert.ok(empty.every(group => group.chat_size === 0 && group.date_last_chat === 0));
++});
++
++test('a failed chat stat skips that group without poisoning later groups or requests', async t => {
++    const { directories, server } = await setup(t);
++    await fs.promises.writeFile(path.join(directories.groupChats, 'shared.jsonl'), 'shared chat');
++    await writeGroup(directories, 'a-fails', ['shared']);
++    await writeGroup(directories, 'b-recovers', ['shared']);
++    await writeGroup(directories, 'c-empty', []);
++    await fs.promises.writeFile(path.join(directories.groups, 'd-malformed.json'), '{broken');
++    t.mock.method(console, 'error', () => {});
++    const stat = fs.statSync;
++    let fail = true;
++    let chatStats = 0;
++    t.mock.method(fs, 'statSync', (file, ...args) => {
++        if (String(file).startsWith(directories.groupChats + path.sep)) {
++            chatStats++;
++            if (fail) {
++                fail = false;
++                throw Object.assign(new Error('temporarily unreadable'), { code: 'EACCES' });
++            }
++        }
++        return stat(file, ...args);
++    });
++    assert.deepEqual((await server.request()).map(group => group.id), ['b-recovers', 'c-empty']);
++    assert.equal(chatStats, 2, 'A failed stat must be retried for another group');
++    assert.deepEqual((await server.request()).map(group => group.id), ['a-fails', 'b-recovers', 'c-empty']);
++    assert.equal(chatStats, 3);
++});
++
++test('groups and chat IDs shared by separate user directories remain isolated', async t => {
++    const { root, directories, server } = await setup(t, { groups: 1, sharedChats: 1 });
++    const otherDirectories = await createGroupListFixture(root, { groups: 1, sharedChats: 1, user: 'another-user' });
++    await fs.promises.writeFile(path.join(otherDirectories.groupChats, 'shared-0.jsonl'), 'another user');
++    const other = await serveGroupRouter(router, otherDirectories);
++    t.after(() => other.close());
++    const first = await server.request();
++    const second = await other.request();
++    assert.deepEqual(first, referenceGroups(directories));
++    assert.deepEqual(second, referenceGroups(otherDirectories));
++    assert.notEqual(first[0].chat_size, second[0].chat_size);
++    assert.deepEqual(await server.request(), first);
++});
+diff --git a/tests/util/group-list-fixture.mjs b/tests/util/group-list-fixture.mjs
+new file mode 100644
+index 00000000..f7981ef4
+--- /dev/null
++++ b/tests/util/group-list-fixture.mjs
+@@ -0,0 +1,46 @@
++import fs from 'node:fs/promises';
++import path from 'node:path';
++import express from 'express';
++
++/** Synthetic groups and JSONL files; no application users or providers are used. */
++export async function createGroupListFixture(root, { groups = 0, chatsPerGroup = 0, sharedChats = 0, user = 'fixture' } = {}) {
++    const directories = { groups: path.join(root, user, 'groups'), groupChats: path.join(root, user, 'group-chats') };
++    await Promise.all(Object.values(directories).map(directory => fs.mkdir(directory, { recursive: true })));
++    const sharedIds = Array.from({ length: sharedChats }, (_, index) => `shared-${index}`);
++    for (const id of sharedIds) await fs.writeFile(path.join(directories.groupChats, `${id}.jsonl`), chatContents(id));
++    for (let index = 0; index < groups; index++) {
++        const id = `group-${String(index).padStart(5, '0')}`;
++        const chats = Array.from({ length: chatsPerGroup }, (_, chat) => `${id}-chat-${chat}`);
++        for (const chat of chats) await fs.writeFile(path.join(directories.groupChats, `${chat}.jsonl`), chatContents(chat));
++        await fs.writeFile(path.join(directories.groups, `${id}.json`), JSON.stringify({
++            id, name: `Group ${index}`, members: ['Character.png'], chats: [...chats, ...sharedIds],
++        }));
++    }
++    return directories;
++}
++
++function chatContents(id) {
++    return JSON.stringify({ chat_metadata: {} }) + '\n'
++        + JSON.stringify({ name: 'Character', mes: `Synthetic chat ${id}`, send_date: '2026-01-01' });
++}
++
++export async function serveGroupRouter(router, directories) {
++    const app = express();
++    app.use(express.json());
++    app.use((request, response, next) => {
++        request.user = { directories };
++        next();
++    });
++    app.use('/api/groups', router);
++    const server = app.listen(0, '127.0.0.1');
++    await new Promise(resolve => server.once('listening', resolve));
++    const origin = `http://127.0.0.1:${server.address().port}`;
++    return {
++        async request() {
++            const response = await fetch(`${origin}/api/groups/all`, { method: 'POST' });
++            if (!response.ok) throw new Error(`Group request failed: ${response.status}`);
++            return response.json();
++        },
++        close: () => new Promise(resolve => server.close(resolve)),
++    };
++}

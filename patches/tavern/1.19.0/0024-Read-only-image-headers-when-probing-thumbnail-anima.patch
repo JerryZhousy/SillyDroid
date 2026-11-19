@@ -1,0 +1,545 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Thu, 22 Oct 2026 21:02:35 +0900
+Subject: [PATCH 24/31] Read only image headers when probing thumbnail
+ animation
+
+---
+ src/endpoints/thumbnails.js      |  27 ++++-
+ tests/bench-thumbnail-header.mjs | 195 +++++++++++++++++++++++++++++++
+ tests/thumbnail-header.node.mjs  | 193 ++++++++++++++++++++++++++++++
+ tests/util/thumbnail-fixture.mjs |  71 +++++++++++
+ 4 files changed, 484 insertions(+), 2 deletions(-)
+ create mode 100644 tests/bench-thumbnail-header.mjs
+ create mode 100644 tests/thumbnail-header.node.mjs
+ create mode 100644 tests/util/thumbnail-fixture.mjs
+
+diff --git a/src/endpoints/thumbnails.js b/src/endpoints/thumbnails.js
+index 789d4e2b..a1dd422f 100644
+--- a/src/endpoints/thumbnails.js
++++ b/src/endpoints/thumbnails.js
+@@ -74,6 +74,29 @@ function getOriginalFolder(directories, type) {
+     return originalFolder;
+ }
+ 
++/**
++ * Reads only the bytes inspected by the existing PNG/WebP animation detectors.
++ * Inspired by TauriTavern's bounded image-header reads (AGPL-3.0):
++ * https://github.com/Darkatse/TauriTavern/blob/edf728b67337eb45c82bbe5a13151d901cd74f4a/src-tauri/crates/tt-adapter-media/src/persistence/thumbnail_cache.rs#L115-L145
++ * @param {string} filePath Original image path
++ * @returns {Buffer} At most 200 bytes, retaining the existing detection boundary
++ */
++function readAnimationHeader(filePath) {
++    const descriptor = fs.openSync(filePath, 'r');
++    try {
++        const buffer = Buffer.alloc(200);
++        let bytesRead = 0;
++        while (bytesRead < buffer.length) {
++            const count = fs.readSync(descriptor, buffer, bytesRead, buffer.length - bytesRead, bytesRead);
++            if (count === 0) break;
++            bytesRead += count;
++        }
++        return buffer.subarray(0, bytesRead);
++    } finally {
++        fs.closeSync(descriptor);
++    }
++}
++
+ /**
+  * Removes the generated thumbnail from the disk.
+  * @param {import('../users.js').UserDirectoryList} directories User directories
+@@ -151,7 +174,7 @@ export async function generateThumbnail(directories, type, file, forceGenerate =
+         // For WebP files, we must check if they are animated, as Jimp cannot process them.
+         // If isKnownAnimated is false, we assume the caller knows it is static and skip this check.
+         if (fileExtension === '.webp' && isKnownAnimated !== false) {
+-            const buffer = fs.readFileSync(pathToOriginalFile);
++            const buffer = readAnimationHeader(pathToOriginalFile);
+             const isAnimated = isAnimatedWebP(buffer);
+             if (isAnimated) {
+                 // The client is expected to handle it.
+@@ -161,7 +184,7 @@ export async function generateThumbnail(directories, type, file, forceGenerate =
+ 
+         // For PNG files, check if they are actually APNGs.
+         if (fileExtension === '.png' && isKnownAnimated !== false) {
+-            const buffer = fs.readFileSync(pathToOriginalFile);
++            const buffer = readAnimationHeader(pathToOriginalFile);
+             const isAnimated = isAnimatedApng(buffer);
+             if (isAnimated) {
+                 // The client is expected to handle it.
+diff --git a/tests/bench-thumbnail-header.mjs b/tests/bench-thumbnail-header.mjs
+new file mode 100644
+index 00000000..52bbf757
+--- /dev/null
++++ b/tests/bench-thumbnail-header.mjs
+@@ -0,0 +1,195 @@
++// Compare actual thumbnail generation using temporary synthetic images. The
++// image probe is timed together with decoding/encoding for static PNGs; this is
++// not an end-to-end page or HTTP download benchmark.
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++import { execFileSync } from 'node:child_process';
++import { createHash } from 'node:crypto';
++import { createRequire } from 'node:module';
++import { performance } from 'node:perf_hooks';
++import { parseArgs } from 'node:util';
++import { fileURLToPath, pathToFileURL } from 'node:url';
++import { setConfigFilePath } from '../src/util.js';
++import '../src/fetch-patch.js';
++import { createThumbnailDirectories, thumbnailPng, thumbnailWebp } from './util/thumbnail-fixture.mjs';
++
++const { values } = parseArgs({ options: {
++    baseline: { type: 'string', default: '46c47c5b0' },
++    rounds: { type: 'string', default: '5' },
++    files: { type: 'string', default: '12' },
++    'image-mib': { type: 'string', default: '2' },
++    help: { type: 'boolean', short: 'h' },
++} });
++if (values.help) {
++    console.log('Usage: node tests/bench-thumbnail-header.mjs [--baseline REF] [--rounds N] [--files N] [--image-mib N]\n'
++        + 'Defaults: --baseline 46c47c5b0 --rounds 5 --files 12 --image-mib 2\n'
++        + 'Reports real generateThumbnail wall time, CPU, and separately instrumented original-file bytes read.\n'
++        + 'Static/APNG fixtures are one-pixel images with large ancillary chunks; WebP fixtures are synthetic animated headers.\n'
++        + 'Uses current supporting modules and dependencies for both endpoint versions. Temporary data is removed.');
++    process.exit(0);
++}
++const rounds = Number(values.rounds);
++const files = Number(values.files);
++const imageMiB = Number(values['image-mib']);
++if (![rounds, files, imageMiB].every(value => Number.isSafeInteger(value) && value > 0)) {
++    throw new Error('Rounds, files and image MiB must be positive integers.');
++}
++process.env.SILLYTAVERN_THUMBNAILS_FORMAT = 'png';
++setConfigFilePath(fileURLToPath(new URL('../default/config.yaml', import.meta.url)));
++const endpoint = new URL('../src/endpoints/thumbnails.js', import.meta.url);
++const endpointRequire = createRequire(endpoint);
++const gitOptions = { cwd: fileURLToPath(new URL('../', import.meta.url)), encoding: 'utf8' };
++const commit = execFileSync('git', ['rev-parse', '--verify', '--end-of-options', `${values.baseline}^{commit}`], gitOptions).trim();
++const source = execFileSync('git', ['show', `${commit}:src/endpoints/thumbnails.js`], gitOptions);
++const resolvedSource = source.replace(/\bfrom\s+(['"])([^'"\r\n]+)\1(?=\s*;)/g, (_, quote, specifier) => {
++    const resolved = specifier.startsWith('.') || specifier.startsWith('/')
++        ? new URL(specifier, endpoint).href
++        : specifier.startsWith('node:') ? specifier : pathToFileURL(endpointRequire.resolve(specifier)).href;
++    return `from '${resolved}'`;
++});
++const implementations = {
++    baseline: await import('data:text/javascript;base64,' + Buffer.from(resolvedSource).toString('base64')),
++    current: await import(endpoint.href),
++};
++const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'st-bench-thumbnail-header-'));
++const original = { open: fs.openSync, read: fs.readSync, close: fs.closeSync, readFile: fs.readFileSync };
++let counters;
++let insideFullRead = false;
++const descriptors = new Set();
++
++try {
++    const directories = await createThumbnailDirectories(root);
++    const paddingBytes = imageMiB * 1024 * 1024;
++    const scenarios = [
++        { name: 'animatedPng', extension: 'png', source: thumbnailPng({ animated: true, paddingBytes }), animated: true },
++        { name: 'animatedWebp', extension: 'webp', source: thumbnailWebp(paddingBytes), animated: true },
++        { name: 'staticPng', extension: 'png', source: thumbnailPng({ paddingBytes }), animated: false },
++    ];
++    for (const scenario of scenarios) {
++        scenario.files = Array.from({ length: files }, (_, i) => `${scenario.name}-${i}.${scenario.extension}`);
++        for (const file of scenario.files) await fs.promises.writeFile(path.join(directories.backgrounds, file), scenario.source);
++    }
++
++    async function run(name, scenario) {
++        const results = [];
++        for (const file of scenario.files) {
++            results.push(await implementations[name].generateThumbnail(directories, 'bg', file, true));
++        }
++        return results;
++    }
++
++    async function verify(results, scenario, expected) {
++        for (const result of results) {
++            if (scenario.animated) {
++                assert.deepEqual(result, { path: null, aspectRatio: null, resolution: null });
++            } else {
++                assert.ok(result.path);
++                assert.equal(result.aspectRatio, 1);
++                assert.equal(result.resolution, 14400);
++            }
++        }
++        const signatures = await Promise.all(results.map(async result => ({
++            ...result,
++            hash: result.path ? createHash('sha256').update(await fs.promises.readFile(result.path)).digest('hex') : null,
++        })));
++        if (expected) assert.deepEqual(signatures, expected);
++        return signatures;
++    }
++
++    // Warm the real image codec before measurements. Both implementations still
++    // force a fresh thumbnail generation for every static image on every run.
++    for (const name of Object.keys(implementations)) await run(name, scenarios[2]);
++    const reports = [];
++    for (const scenario of scenarios) {
++        let expected;
++        const samples = [];
++        for (let round = 0; round < rounds; round++) {
++            const order = round % 2 ? ['current', 'baseline'] : ['baseline', 'current'];
++            const sample = { round: round + 1, order };
++            for (const name of order) {
++                const cpuStart = process.cpuUsage();
++                const start = performance.now();
++                const result = await run(name, scenario);
++                const durationMs = performance.now() - start;
++                const cpu = process.cpuUsage(cpuStart);
++                sample[name] = { durationMs: rounded(durationMs), cpuMs: rounded((cpu.user + cpu.system) / 1000) };
++                expected = await verify(result, scenario, expected);
++            }
++            samples.push(sample);
++        }
++        reports.push({ scenario: scenario.name, bytesPerOriginal: scenario.source.length, samples, expected });
++    }
++
++    // Count original-file I/O separately so instrumentation does not affect the
++    // timings. Serving an original to the browser is outside this measurement.
++    fs.openSync = function (file, ...args) {
++        const descriptor = original.open.call(this, file, ...args);
++        if (counters && !insideFullRead && String(file).startsWith(directories.backgrounds + path.sep)) {
++            descriptors.add(descriptor);
++            counters.headerOpens++;
++        }
++        return descriptor;
++    };
++    fs.readSync = function (descriptor, ...args) {
++        const count = original.read.call(this, descriptor, ...args);
++        if (counters && descriptors.has(descriptor)) counters.headerBytes += count;
++        return count;
++    };
++    fs.closeSync = function (descriptor) {
++        if (descriptors.delete(descriptor) && counters) counters.headerCloses++;
++        return original.close.call(this, descriptor);
++    };
++    fs.readFileSync = function (file, ...args) {
++        insideFullRead = true;
++        try {
++            const result = original.readFile.call(this, file, ...args);
++            if (counters && String(file).startsWith(directories.backgrounds + path.sep)) {
++                counters.fullReads++;
++                counters.fullBytes += result.length;
++            }
++            return result;
++        } finally {
++            insideFullRead = false;
++        }
++    };
++    for (let i = 0; i < reports.length; i++) {
++        const report = reports[i];
++        report.summary = {};
++        for (const name of Object.keys(implementations)) {
++            counters = { headerOpens: 0, headerCloses: 0, headerBytes: 0, fullReads: 0, fullBytes: 0 };
++            const result = await run(name, scenarios[i]);
++            const counts = counters;
++            counters = undefined;
++            await verify(result, scenarios[i], report.expected);
++            assert.equal(counts.headerOpens, counts.headerCloses);
++            report.summary[name] = {
++                medianMs: median(report.samples.map(sample => sample[name].durationMs)),
++                medianCpuMs: median(report.samples.map(sample => sample[name].cpuMs)),
++                originalBytesRead: counts.fullBytes + counts.headerBytes,
++                operations: counts,
++            };
++        }
++        delete report.expected;
++    }
++    console.log(JSON.stringify({ baseline: { ref: values.baseline, commit }, filesPerScenario: files, imageMiB, rounds, reports,
++        note: 'Actual generateThumbnail calls; animated images skip decoding and static PNGs use the real Jimp WASM codec, resize and encode. One-pixel synthetic fixtures isolate redundant reads without simulating the decode cost of high-resolution images. Every static output is hash-compared. Measurements exclude HTTP delivery, directory setup, verification and instrumented operation counts. OS disk cache is not cleared; timings vary with load.',
++    }, null, 2));
++} finally {
++    fs.openSync = original.open;
++    fs.readSync = original.read;
++    fs.closeSync = original.close;
++    fs.readFileSync = original.readFile;
++    await fs.promises.rm(root, { recursive: true, force: true });
++}
++
++function rounded(value) {
++    return +value.toFixed(2);
++}
++
++function median(items) {
++    const sorted = [...items].sort((a, b) => a - b);
++    const middle = Math.floor(sorted.length / 2);
++    return rounded(sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2);
++}
+diff --git a/tests/thumbnail-header.node.mjs b/tests/thumbnail-header.node.mjs
+new file mode 100644
+index 00000000..f446052b
+--- /dev/null
++++ b/tests/thumbnail-header.node.mjs
+@@ -0,0 +1,193 @@
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++import test from 'node:test';
++import { fileURLToPath } from 'node:url';
++import { imageSize } from 'image-size';
++import { setConfigFilePath } from '../src/util.js';
++import '../src/fetch-patch.js';
++import { createThumbnailDirectories, serveThumbnails, thumbnailPng, thumbnailWebp } from './util/thumbnail-fixture.mjs';
++
++process.env.SILLYTAVERN_THUMBNAILS_FORMAT = 'png';
++setConfigFilePath(fileURLToPath(new URL('../default/config.yaml', import.meta.url)));
++const { generateThumbnail, publicRouter } = await import('../src/endpoints/thumbnails.js');
++const { Jimp } = await import('../src/jimp.js');
++
++async function setup(t) {
++    const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'st-thumbnail-header-'));
++    t.after(() => fs.promises.rm(root, { recursive: true, force: true }));
++    const directories = await createThumbnailDirectories(root);
++    const server = await serveThumbnails(publicRouter, directories);
++    t.after(server.close);
++    return { directories, server };
++}
++
++function watchReads(t, file, { maxRead = Infinity, readError = false, openError = false } = {}) {
++    const original = { open: fs.openSync, read: fs.readSync, close: fs.closeSync, readFile: fs.readFileSync };
++    const descriptors = new Set();
++    const counts = { opened: 0, closed: 0, headerBytes: 0, fullReads: 0, fullBytes: 0 };
++    let insideFullRead = false;
++    t.mock.method(fs, 'openSync', function (name, ...args) {
++        if (String(name) === file && openError) throw Object.assign(new Error('Synthetic open failure'), { code: 'EACCES' });
++        const descriptor = original.open.call(this, name, ...args);
++        if (String(name) === file && !insideFullRead) {
++            descriptors.add(descriptor);
++            counts.opened++;
++        }
++        return descriptor;
++    });
++    t.mock.method(fs, 'readSync', function (descriptor, buffer, offset, length, position) {
++        if (descriptors.has(descriptor)) {
++            if (readError) throw Object.assign(new Error('Synthetic read failure'), { code: 'EIO' });
++            const count = original.read.call(this, descriptor, buffer, offset, Math.min(length, maxRead), position);
++            counts.headerBytes += count;
++            return count;
++        }
++        return original.read.call(this, descriptor, buffer, offset, length, position);
++    });
++    t.mock.method(fs, 'closeSync', function (descriptor) {
++        if (descriptors.delete(descriptor)) counts.closed++;
++        return original.close.call(this, descriptor);
++    });
++    t.mock.method(fs, 'readFileSync', function (name, ...args) {
++        insideFullRead = true;
++        try {
++            const result = original.readFile.call(this, name, ...args);
++            if (String(name) === file) {
++                counts.fullReads++;
++                counts.fullBytes += result.length;
++            }
++            return result;
++        } finally {
++            insideFullRead = false;
++        }
++    });
++    return counts;
++}
++
++test('animated PNG and WebP HTTP responses preserve originals without a full probe read', async (t) => {
++    const { directories, server } = await setup(t);
++    const readImage = t.mock.method(Jimp, 'read', () => { throw new Error('Animated images must not be decoded'); });
++    for (const [name, source] of [['animated.png', thumbnailPng({ animated: true, paddingBytes: 4096 })], ['animated.webp', thumbnailWebp(4096)]]) {
++        await t.test(name, async (t) => {
++            const file = path.join(directories.backgrounds, name);
++            await fs.promises.writeFile(file, source);
++            const counts = watchReads(t, file);
++            const response = await server.request(name);
++            assert.equal(response.status, 200);
++            assert.deepEqual(Buffer.from(await response.arrayBuffer()), source);
++            assert.deepEqual(counts, { opened: 1, closed: 1, headerBytes: 200, fullReads: 0, fullBytes: 0 });
++            assert.equal(fs.existsSync(path.join(directories.thumbnailsBg, name)), false);
++        });
++    }
++    assert.equal(readImage.mock.callCount(), 0);
++});
++
++test('static PNG and WebP HTTP generation read their pixels once, then serve cached thumbnails', async (t) => {
++    const { directories, server } = await setup(t);
++    const png = thumbnailPng({ paddingBytes: 4096 });
++    const webp = await (await Jimp.read(png)).getBuffer('image/webp');
++    for (const [name, source] of [['static.png', png], ['static.webp', webp]]) {
++        await t.test(name, async (t) => {
++            const file = path.join(directories.backgrounds, name);
++            await fs.promises.writeFile(file, source);
++            const counts = watchReads(t, file);
++            const first = await server.request(name);
++            assert.equal(first.status, 200);
++            const thumbnail = Buffer.from(await first.arrayBuffer());
++            assert.equal(imageSize(thumbnail).width, 120);
++            assert.equal(imageSize(thumbnail).height, 120);
++            assert.deepEqual(counts, { opened: 1, closed: 1, headerBytes: Math.min(source.length, 200), fullReads: 1, fullBytes: source.length });
++            const second = await server.request(name);
++            assert.equal(second.status, 200);
++            assert.deepEqual(Buffer.from(await second.arrayBuffer()), thumbnail);
++            assert.equal(counts.opened, 1);
++            assert.equal(counts.fullReads, 1);
++        });
++    }
++});
++
++test('short header reads preserve the exact 200-byte detector boundary', async (t) => {
++    const { directories } = await setup(t);
++    for (const [marker, extension] of [['acTL', 'png'], ['ANIM', 'webp'], ['ANMF', 'webp']]) {
++        for (const offset of [196, 197]) {
++            await t.test(`${marker} at ${offset}`, async (t) => {
++                const name = `boundary-${marker}-${offset}.${extension}`;
++                const file = path.join(directories.backgrounds, name);
++                const source = Buffer.alloc(256);
++                source.write(marker, offset);
++                await fs.promises.writeFile(file, source);
++                const counts = watchReads(t, file, { maxRead: 7 });
++                const decoder = t.mock.method(Jimp, 'read', () => { throw new Error('Deliberately invalid static fixture'); });
++                t.mock.method(console, 'warn', () => {});
++                t.mock.method(console, 'error', () => {});
++                assert.equal((await generateThumbnail(directories, 'bg', name)).path, null);
++                assert.equal(counts.headerBytes, 200);
++                assert.equal(counts.opened, counts.closed);
++                assert.equal(decoder.mock.callCount(), offset === 196 ? 0 : 1);
++            });
++        }
++    }
++});
++
++test('empty and truncated files close the probe descriptor and retain failure fallback', async (t) => {
++    const { directories } = await setup(t);
++    for (const size of [0, 3, 199]) {
++        await t.test(`${size} bytes`, async (t) => {
++            const name = `short-${size}.png`;
++            const file = path.join(directories.backgrounds, name);
++            await fs.promises.writeFile(file, Buffer.alloc(size));
++            const counts = watchReads(t, file, { maxRead: 7 });
++            t.mock.method(Jimp, 'read', () => { throw new Error('Invalid short image'); });
++            t.mock.method(console, 'warn', () => {});
++            t.mock.method(console, 'error', () => {});
++            assert.equal((await generateThumbnail(directories, 'bg', name)).path, null);
++            assert.equal(counts.headerBytes, size);
++            assert.equal(counts.opened, 1);
++            assert.equal(counts.closed, 1);
++        });
++    }
++});
++
++test('read errors close the descriptor and HTTP falls back to the original image', async (t) => {
++    const { directories, server } = await setup(t);
++    const name = 'read-error.png';
++    const file = path.join(directories.backgrounds, name);
++    const source = thumbnailPng();
++    await fs.promises.writeFile(file, source);
++    const counts = watchReads(t, file, { readError: true });
++    t.mock.method(console, 'error', () => {});
++    const response = await server.request(name);
++    assert.equal(response.status, 200);
++    assert.deepEqual(Buffer.from(await response.arrayBuffer()), source);
++    assert.deepEqual(counts, { opened: 1, closed: 1, headerBytes: 0, fullReads: 0, fullBytes: 0 });
++});
++
++test('open errors preserve the original-image fallback without closing an unrelated descriptor', async (t) => {
++    const { directories, server } = await setup(t);
++    const name = 'open-error.png';
++    const file = path.join(directories.backgrounds, name);
++    const source = thumbnailPng();
++    await fs.promises.writeFile(file, source);
++    const counts = watchReads(t, file, { openError: true });
++    t.mock.method(console, 'error', () => {});
++    const response = await server.request(name);
++    assert.equal(response.status, 200);
++    assert.deepEqual(Buffer.from(await response.arrayBuffer()), source);
++    assert.deepEqual(counts, { opened: 0, closed: 0, headerBytes: 0, fullReads: 0, fullBytes: 0 });
++});
++
++test('known animation flags preserve their existing probe bypass', async (t) => {
++    const { directories } = await setup(t);
++    const name = 'known-static.png';
++    const file = path.join(directories.backgrounds, name);
++    const source = thumbnailPng();
++    await fs.promises.writeFile(file, source);
++    const counts = watchReads(t, file);
++    assert.equal((await generateThumbnail(directories, 'bg', name, false, true)).path, null);
++    assert.deepEqual(counts, { opened: 0, closed: 0, headerBytes: 0, fullReads: 0, fullBytes: 0 });
++    assert.ok((await generateThumbnail(directories, 'bg', name, false, false)).path);
++    assert.equal(counts.opened, 0);
++    assert.equal(counts.fullReads, 1);
++});
+diff --git a/tests/util/thumbnail-fixture.mjs b/tests/util/thumbnail-fixture.mjs
+new file mode 100644
+index 00000000..ef731928
+--- /dev/null
++++ b/tests/util/thumbnail-fixture.mjs
+@@ -0,0 +1,71 @@
++import fs from 'node:fs/promises';
++import path from 'node:path';
++import { deflateSync } from 'node:zlib';
++import express from 'express';
++import encodePng from '../../src/png/encode.js';
++
++/** Valid one-pixel PNG, optionally with an APNG frame and a large ancillary chunk. */
++export function thumbnailPng({ animated = false, paddingBytes = 0 } = {}) {
++    const header = Buffer.alloc(13);
++    header.writeUInt32BE(1, 0);
++    header.writeUInt32BE(1, 4);
++    header[8] = 8;
++    header[9] = 6;
++    const chunks = [{ name: 'IHDR', data: header }];
++    if (animated) {
++        const control = Buffer.alloc(8);
++        control.writeUInt32BE(1, 0);
++        const frame = Buffer.alloc(26);
++        frame.writeUInt32BE(1, 4);
++        frame.writeUInt32BE(1, 8);
++        frame.writeUInt16BE(1, 20);
++        frame.writeUInt16BE(10, 22);
++        chunks.push({ name: 'acTL', data: control }, { name: 'fcTL', data: frame });
++    }
++    if (paddingBytes > 0) {
++        // Private ancillary chunks are skipped by image decoders. Keep each
++        // chunk below the WASM decoder's per-chunk allocation limit.
++        for (let remaining = paddingBytes; remaining > 0; remaining -= 262144) {
++            chunks.push({ name: 'stAg', data: Buffer.alloc(Math.min(remaining, 262144), 65) });
++        }
++    }
++    chunks.push({ name: 'IDAT', data: deflateSync(Buffer.from([0, 255, 0, 0, 255])) });
++    chunks.push({ name: 'IEND', data: Buffer.alloc(0) });
++    return Buffer.from(encodePng(chunks));
++}
++
++/** Header-only synthetic animated WebP; decoding is deliberately bypassed. */
++export function thumbnailWebp(size = 256) {
++    const data = Buffer.alloc(Math.max(size, 44));
++    data.write('RIFF');
++    data.writeUInt32LE(data.length - 8, 4);
++    data.write('WEBPVP8X', 8);
++    data.writeUInt32LE(10, 16);
++    data[20] = 2;
++    data.write('ANIM', 30);
++    data.writeUInt32LE(6, 34);
++    return data;
++}
++
++export async function createThumbnailDirectories(root) {
++    const directories = Object.fromEntries([
++        'backgrounds', 'characters', 'avatars', 'thumbnailsBg', 'thumbnailsAvatar', 'thumbnailsPersona',
++    ].map(key => [key, path.join(root, key)]));
++    await Promise.all(Object.values(directories).map(directory => fs.mkdir(directory, { recursive: true })));
++    return directories;
++}
++
++export async function serveThumbnails(router, directories) {
++    const app = express();
++    app.use((request, response, next) => {
++        request.user = { directories };
++        next();
++    });
++    app.use('/thumbnail', router);
++    const server = app.listen(0, '127.0.0.1');
++    await new Promise(resolve => server.once('listening', resolve));
++    return {
++        request: (file, type = 'bg') => fetch(`http://127.0.0.1:${server.address().port}/thumbnail?${new URLSearchParams({ file, type })}`),
++        close: () => new Promise(resolve => server.close(resolve)),
++    };
++}

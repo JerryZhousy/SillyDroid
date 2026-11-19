@@ -1,0 +1,771 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Thu, 22 Oct 2026 18:10:30 +0900
+Subject: [PATCH 04/31] Cache chat summaries and preserve imported histories
+
+---
+ src/chat-info-cache.js         | 134 ++++++++++++++++++++
+ src/endpoints/chats.js         |  97 +++++++++++----
+ tests/chat-import.node.mjs     | 120 ++++++++++++++++++
+ tests/chat-info-cache.node.mjs | 218 +++++++++++++++++++++++++++++++++
+ tests/chat-search.node.mjs     |  25 ++++
+ 5 files changed, 570 insertions(+), 24 deletions(-)
+ create mode 100644 src/chat-info-cache.js
+ create mode 100644 tests/chat-import.node.mjs
+ create mode 100644 tests/chat-info-cache.node.mjs
+
+diff --git a/src/chat-info-cache.js b/src/chat-info-cache.js
+new file mode 100644
+index 00000000..474be2a8
+--- /dev/null
++++ b/src/chat-info-cache.js
+@@ -0,0 +1,134 @@
++import fs from 'node:fs';
++import path from 'node:path';
++
++/**
++ * Bounds chat preview reads and retains small, unchanged summaries in memory.
++ * Every lookup is validated against a fresh stat by the caller; there is no TTL
++ * during which a saved, replaced or externally edited chat may remain stale.
++ */
++export class ChatInfoCache {
++    #entries = new Map();
++    #pending = new Map();
++    #queue = [];
++    #active = 0;
++    #bytes = 0;
++
++    constructor({ maxEntries = 256, maxBytes = 8 * 1024 * 1024, maxEntryBytes = 256 * 1024, concurrency = 8 } = {}) {
++        this.maxEntries = maxEntries;
++        this.maxBytes = maxBytes;
++        this.maxEntryBytes = maxEntryBytes;
++        this.concurrency = Math.max(1, concurrency);
++    }
++
++    /**
++     * Includes inode identity and ctime so atomic replacement and same-size
++     * edits with a restored mtime invalidate a previously cached summary.
++     * @param {import('node:fs').Stats} stats File stats
++     * @returns {string} File version
++     */
++    static version(stats) {
++        return [stats.dev, stats.ino, stats.size, stats.mtimeMs, stats.ctimeMs].join(':');
++    }
++
++    /**
++     * @template T
++     * @param {() => Promise<T>} task Read operation
++     * @returns {Promise<T>} Task result
++     */
++    async #run(task) {
++        if (this.#active >= this.concurrency) {
++            await new Promise(resolve => this.#queue.push(resolve));
++        } else {
++            this.#active++;
++        }
++
++        try {
++            return await task();
++        } finally {
++            const next = this.#queue.shift();
++            if (next) next();
++            else this.#active--;
++        }
++    }
++
++    #delete(key) {
++        const entry = this.#entries.get(key);
++        if (entry) this.#bytes -= entry.bytes;
++        this.#entries.delete(key);
++    }
++
++    /**
++     * Drops both metadata variants when a file disappears.
++     * @param {string} filePath Chat file path
++     */
++    delete(filePath) {
++        this.#delete(JSON.stringify([path.resolve(filePath), false]));
++        this.#delete(JSON.stringify([path.resolve(filePath), true]));
++    }
++
++    /**
++     * @param {string} filePath Chat file path
++     * @param {import('node:fs').Stats} stats Fresh file stats
++     * @param {boolean} withMetadata Whether the header metadata is requested
++     * @param {() => Promise<import('./endpoints/chats.js').ChatInfo|null>} read Reads a summary, or null if the file vanished
++     * @param {boolean} cacheable False for searches, whose matchers must run independently
++     * @returns {Promise<import('./endpoints/chats.js').ChatInfo|null>} A caller-owned summary
++     */
++    async read(filePath, stats, withMetadata, read, cacheable = true) {
++        if (!cacheable) return this.#run(read);
++
++        const key = JSON.stringify([path.resolve(filePath), !!withMetadata]);
++        const version = ChatInfoCache.version(stats);
++        const cached = this.#entries.get(key);
++        if (cached?.version === version) {
++            this.#entries.delete(key);
++            this.#entries.set(key, cached);
++            return JSON.parse(cached.serialized);
++        }
++        this.#delete(key);
++
++        const pending = this.#pending.get(key);
++        if (pending?.version === version) {
++            return globalThis.structuredClone(await pending.promise);
++        }
++
++        const promise = this.#run(async () => {
++            const summary = await read();
++            if (summary === null) return summary;
++
++            // A write or rename during the scan must not poison the cache. A
++            // failure to re-stat also leaves the result usable but uncached.
++            let currentStats;
++            try {
++                currentStats = await fs.promises.stat(filePath);
++            } catch {
++                return summary;
++            }
++            if (ChatInfoCache.version(currentStats) !== version) return summary;
++
++            // Avoid serializing an exceptionally large final message twice.
++            if (typeof summary.mes === 'string' && summary.mes.length * 2 > this.maxEntryBytes) return summary;
++            const serialized = JSON.stringify(summary);
++            const bytes = (key.length + version.length + serialized.length) * 2;
++            if (this.maxEntries <= 0 || bytes > this.maxEntryBytes || bytes > this.maxBytes) return summary;
++
++            this.#delete(key);
++            while (this.#entries.size >= this.maxEntries || this.#bytes + bytes > this.maxBytes) {
++                this.#delete(this.#entries.keys().next().value);
++            }
++            this.#entries.set(key, { version, serialized, bytes });
++            this.#bytes += bytes;
++            return summary;
++        });
++        const entry = { version, promise };
++
++        // The queue already limits open streams; also cap retained deduplication
++        // keys when a client asks for an unusually large directory at once.
++        if (this.#pending.size < this.maxEntries) this.#pending.set(key, entry);
++        try {
++            return await promise;
++        } finally {
++            if (this.#pending.get(key) === entry) this.#pending.delete(key);
++        }
++    }
++}
+diff --git a/src/endpoints/chats.js b/src/endpoints/chats.js
+index f8f89190..abb90452 100644
+--- a/src/endpoints/chats.js
++++ b/src/endpoints/chats.js
+@@ -9,6 +9,7 @@ import sanitize from 'sanitize-filename';
+ import { sync as writeFileAtomicSync } from 'write-file-atomic';
+ import _ from 'lodash';
+ 
++import { ChatInfoCache } from '../chat-info-cache.js';
+ import validateAvatarUrlMiddleware from '../middleware/validateFileName.js';
+ import {
+     getConfigValue,
+@@ -22,12 +23,14 @@ import {
+     tryDeleteFile,
+     readFirstLine,
+     isPathUnderParent,
++    getUniqueName,
+ } from '../util.js';
+ 
+ const isBackupEnabled = !!getConfigValue('backups.chat.enabled', true, 'boolean');
+ const maxTotalChatBackups = Number(getConfigValue('backups.chat.maxTotalBackups', -1, 'number'));
+ const throttleInterval = Number(getConfigValue('backups.chat.throttleInterval', 10_000, 'number'));
+ const checkIntegrity = !!getConfigValue('backups.chat.checkIntegrity', true, 'boolean');
++const chatInfoCache = new ChatInfoCache();
+ 
+ export const CHAT_BACKUPS_PREFIX = 'chat_';
+ 
+@@ -222,8 +225,7 @@ function importCAIChat(userName, characterName, jsonData) {
+         return [starter, ...historyData];
+     }
+ 
+-    const newChats = (jsonData.histories.histories ?? []).map(history => newChats.push(convert(history).map(obj => JSON.stringify(obj)).join('\n')));
+-    return newChats;
++    return (jsonData.histories.histories ?? []).map(history => convert(history).map(obj => JSON.stringify(obj)).join('\n'));
+ }
+ 
+ /**
+@@ -413,21 +415,14 @@ export function createChatSearchMatcher(fragments) {
+  */
+ export async function getChatInfo(pathToFile, additionalData = {}, withMetadata = false, matcher = null) {
+     const parsedPath = path.parse(pathToFile);
+-    const incrementalMatcher = typeof matcher === 'object' && typeof matcher?.test === 'function' ? matcher : null;
+-    const hasMatcher = typeof matcher === 'function' || !!incrementalMatcher;
+-
+-    // A chat that is deleted while a scan is running is not an error: treat it like a corrupted chat and move on.
+-    const chatVanished = () => {
+-        console.warn('Chat file was deleted while it was being scanned:', pathToFile);
+-        return { match: false };
+-    };
+ 
+     let stats;
+     try {
+         stats = await fs.promises.stat(pathToFile);
+     } catch (error) {
+         if (error.code === 'ENOENT') {
+-            return chatVanished();
++            chatInfoCache.delete(pathToFile);
++            return { match: false };
+         }
+         throw error;
+     }
+@@ -447,16 +442,55 @@ export async function getChatInfo(pathToFile, additionalData = {}, withMetadata
+         return chatData;
+     }
+ 
++    const hasMatcher = typeof matcher === 'function' || typeof matcher?.test === 'function';
++    const summary = await chatInfoCache.read(pathToFile, stats, withMetadata,
++        () => readChatInfo(pathToFile, stats, withMetadata, matcher), !hasMatcher);
++    return summary === null ? { match: false } : { ...chatData, ...summary };
++}
++
++/**
++ * Scans content only, keeping caller-specific fields out of the shared cache.
++ * @param {string} pathToFile Chat file path
++ * @param {import('node:fs').Stats} stats File stats before the scan
++ * @param {boolean} withMetadata Whether to read chat metadata
++ * @param {ChatMatchFunction|ChatTextMatcher|null} matcher Optional message matcher
++ * @returns {Promise<ChatInfo|null>} Summary fields, or null if the file disappeared
++ */
++function readChatInfo(pathToFile, stats, withMetadata, matcher) {
++    const incrementalMatcher = typeof matcher === 'object' && typeof matcher?.test === 'function' ? matcher : null;
++    const hasMatcher = typeof matcher === 'function' || !!incrementalMatcher;
++    /** @type {ChatInfo} */
++    const chatData = {};
++
+     return new Promise((res, rej) => {
+         const fileStream = fs.createReadStream(pathToFile);
++        let finished = false;
++        /**
++         * @param {ChatInfo|null} value Scan result
++         * @param {Error|null} error Read error
++         */
++        const finish = (value, error = null) => {
++            if (finished) return;
++            finished = true;
++            // Keep the read slot until the descriptor is actually closed.
++            // readline's close event can precede the stream's asynchronous close.
++            const settle = () => error ? rej(error) : res(value);
++            if (fileStream.closed) settle();
++            else {
++                fileStream.once('close', settle);
++                fileStream.destroy();
++            }
++            rl.close();
++        };
+ 
+         // The file can still disappear between the stat above and the stream opening
+-        fileStream.on('error', (error) => {
++        fileStream.on('error', (/** @type {NodeJS.ErrnoException} */ error) => {
+             if (error.code === 'ENOENT') {
+-                res(chatVanished());
++                chatInfoCache.delete(pathToFile);
++                finish(null);
+                 return;
+             }
+-            rej(error);
++            finish(null, error);
+         });
+ 
+         const rl = readline.createInterface({
+@@ -467,10 +501,10 @@ export async function getChatInfo(pathToFile, additionalData = {}, withMetadata
+         // readline re-emits input stream errors; without a listener the emit throws
+         rl.on('error', (error) => {
+             if (error.code === 'ENOENT') {
+-                res(chatVanished());
++                finish(null);
+                 return;
+             }
+-            rej(error);
++            finish(null, error);
+         });
+ 
+         let lastLine;
+@@ -503,6 +537,7 @@ export async function getChatInfo(pathToFile, additionalData = {}, withMetadata
+             lastLine = line;
+         });
+         rl.on('close', () => {
++            if (finished) return;
+             if (lastLine) {
+                 const jsonData = tryParse(lastLine);
+                 if (jsonData && (jsonData.name || jsonData.character_name || jsonData.chat_metadata)) {
+@@ -511,7 +546,7 @@ export async function getChatInfo(pathToFile, additionalData = {}, withMetadata
+                     chatData.last_mes = jsonData.send_date || new Date(Math.round(stats.mtimeMs)).toISOString();
+                     chatData.match = hasMatcher ? hasAnyMatch : true;
+ 
+-                    res(chatData);
++                    finish(chatData);
+                 } else {
+                     // The last line is unparseable or lacks known fields (e.g. a truncated write or an external edit).
+                     // Resolve a degraded preview from the stat data instead of hiding an otherwise intact chat
+@@ -521,11 +556,11 @@ export async function getChatInfo(pathToFile, additionalData = {}, withMetadata
+                     chatData.chat_items = Math.max(itemCounter - 2, 0);
+                     chatData.mes = '[The message is empty]';
+                     chatData.match = hasMatcher ? hasAnyMatch : true;
+-                    res(chatData);
++                    finish(chatData);
+                 }
+             } else {
+                 // The file was truncated after the stat reported a non-zero size; treat it like an empty chat
+-                res(chatData);
++                finish(chatData);
+             }
+         });
+     });
+@@ -782,10 +817,12 @@ router.post('/group/import', function (request, response) {
+             return response.sendStatus(400);
+         }
+ 
+-        const chatname = humanizedDateTime();
++        const chatname = getUniqueName(humanizedDateTime(),
++            name => fs.existsSync(path.join(request.user.directories.groupChats, `${name}.jsonl`)), { startIndex: 0 });
++        if (chatname === null) throw new Error('Could not find an unused filename for the imported group chat.');
+         const pathToUpload = path.join(filedata.destination, filedata.filename);
+         const pathToNewFile = path.join(request.user.directories.groupChats, `${chatname}.jsonl`);
+-        fs.copyFileSync(pathToUpload, pathToNewFile);
++        fs.copyFileSync(pathToUpload, pathToNewFile, fs.constants.COPYFILE_EXCL);
+         fs.unlinkSync(pathToUpload);
+         return response.send({ res: chatname });
+     } catch (error) {
+@@ -812,6 +849,15 @@ router.post('/import', validateAvatarUrlMiddleware, function (request, response)
+         return response.sendStatus(400);
+     }
+ 
++    // One upload can contain several histories, and multiple imports can share
++    // a timestamp. Never replace an earlier chat with another imported history.
++    const getImportFileName = () => {
++        const name = getUniqueName(`${characterName} - ${humanizedDateTime()} imported`,
++            name => fs.existsSync(path.join(directoryPath, `${name}.jsonl`)), { startIndex: 0 });
++        if (name === null) throw new Error('Could not find an unused filename for the imported chat.');
++        return `${name}.jsonl`;
++    };
++
+     try {
+         const pathToUpload = path.join(request.file.destination, request.file.filename);
+         const data = fs.readFileSync(pathToUpload, 'utf8');
+@@ -839,7 +885,7 @@ router.post('/import', validateAvatarUrlMiddleware, function (request, response)
+             }
+ 
+             const handleChat = (chat) => {
+-                const fileName = `${characterName} - ${humanizedDateTime()} imported.jsonl`;
++                const fileName = getImportFileName();
+                 const filePath = path.join(directoryPath, fileName);
+                 fileNames.push(fileName);
+                 writeFileAtomicSync(filePath, chat, 'utf8');
+@@ -878,7 +924,7 @@ router.post('/import', validateAvatarUrlMiddleware, function (request, response)
+                 console.warn('Failed to flatten Chub Chat data: ', error);
+             }
+ 
+-            const fileName = `${characterName} - ${humanizedDateTime()} imported.jsonl`;
++            const fileName = getImportFileName();
+             const filePath = path.join(directoryPath, fileName);
+             fileNames.push(fileName);
+             if (flattenedChat !== data) {
+@@ -1044,6 +1090,9 @@ router.post('/search', validateAvatarUrlMiddleware, async function (request, res
+         };
+ 
+         for (const chatFile of chatFiles) {
++            // The client cancels obsolete searches while typing or switching
++            // chats. Stop after the current file instead of scanning the rest.
++            if (response.destroyed) return;
+             const matcher = query ? createChatSearchMatcher(fragments) : null;
+             const chatInfo = await getChatInfo(chatFile, {}, false, matcher);
+             const hasMatch = chatInfo.match || hasTextMatch([chatInfo.file_id ?? '']);
+@@ -1070,7 +1119,7 @@ router.post('/search', validateAvatarUrlMiddleware, async function (request, res
+             }
+         }
+ 
+-        return response.send(results);
++        if (!response.destroyed) return response.send(results);
+     } catch (error) {
+         console.error('Chat search error:', error);
+         return response.status(500).json({ error: 'Search failed' });
+diff --git a/tests/chat-import.node.mjs b/tests/chat-import.node.mjs
+new file mode 100644
+index 00000000..94628fcd
+--- /dev/null
++++ b/tests/chat-import.node.mjs
+@@ -0,0 +1,120 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++import fs from 'node:fs/promises';
++import os from 'node:os';
++import path from 'node:path';
++import express from 'express';
++
++process.env.SILLYTAVERN_BACKUPS_CHAT_ENABLED = 'false';
++process.env.SILLYTAVERN_BACKUPS_CHAT_MAXTOTALBACKUPS = '-1';
++process.env.SILLYTAVERN_BACKUPS_CHAT_THROTTLEINTERVAL = '0';
++process.env.SILLYTAVERN_BACKUPS_CHAT_CHECKINTEGRITY = 'true';
++const { router } = await import('../src/endpoints/chats.js');
++const { humanizedDateTime } = await import('../src/util.js');
++
++async function setup(t) {
++    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'st-chat-import-'));
++    t.after(() => fs.rm(root, { recursive: true, force: true }));
++    const chats = path.join(root, 'chats');
++    const groupChats = path.join(root, 'group-chats');
++    const characterDirectory = path.join(chats, 'Character');
++    await fs.mkdir(characterDirectory, { recursive: true });
++    await fs.mkdir(groupChats);
++    const upload = path.join(root, 'upload.json');
++    const app = express();
++    app.use(express.json());
++    app.use((request, response, next) => {
++        request.user = /** @type {any} */ ({ directories: { chats, groupChats } });
++        request.file = /** @type {any} */ ({ destination: root, filename: path.basename(upload) });
++        next();
++    });
++    app.use('/api/chats', router);
++    const server = app.listen(0, '127.0.0.1');
++    await new Promise(resolve => server.once('listening', resolve));
++    t.after(() => new Promise(resolve => server.close(resolve)));
++    const address = server.address();
++    assert.ok(address && typeof address === 'object');
++    const importChat = async (data, fileType = 'json') => {
++        await fs.writeFile(upload, typeof data === 'string' ? data : JSON.stringify(data));
++        const response = await fetch(`http://127.0.0.1:${address.port}/api/chats/import`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({ file_type: fileType, avatar_url: 'Character.png', character_name: 'Character', user_name: 'Player' }),
++        });
++        assert.equal(response.status, 200);
++        return response.json();
++    };
++    const importGroupChat = async (data) => {
++        await fs.writeFile(upload, data);
++        const response = await fetch(`http://127.0.0.1:${address.port}/api/chats/group/import`, { method: 'POST' });
++        assert.equal(response.status, 200);
++        return response.json();
++    };
++    return { characterDirectory, groupChats, upload, importChat, importGroupChat };
++}
++
++test('CAI Tools HTTP import preserves every history, message role and existing file at one timestamp', async (t) => {
++    const { characterDirectory, upload, importChat } = await setup(t);
++    const timestamp = 1767225600000;
++    t.mock.method(Date, 'now', () => timestamp);
++    const existing = path.join(characterDirectory, `Character - ${humanizedDateTime(timestamp)} imported.jsonl`);
++    await fs.writeFile(existing, 'keep the existing chat');
++    const response = await importChat({
++        histories: {
++            histories: [
++                { msgs: [{ src: { is_human: true }, text: 'First human message' }, { src: { is_human: false }, text: 'First reply' }] },
++                { msgs: [{ src: { is_human: false }, text: 'Second history' }] },
++                { msgs: [] },
++            ],
++        },
++    });
++    assert.equal(response.res, true);
++    assert.equal(response.fileNames.length, 3);
++    assert.equal(new Set(response.fileNames).size, 3);
++    assert.equal((await fs.readdir(characterDirectory)).length, 4);
++    assert.equal(await fs.readFile(existing, 'utf8'), 'keep the existing chat');
++    const imported = await Promise.all(response.fileNames.map(async file => {
++        const content = await fs.readFile(path.join(characterDirectory, file), 'utf8');
++        return content.split('\n').map(line => JSON.parse(line));
++    }));
++    assert.deepEqual(imported[0][0].chat_metadata, {});
++    assert.deepEqual(imported[0].slice(1).map(({ name, is_user, mes }) => ({ name, is_user, mes })), [
++        { name: 'Player', is_user: true, mes: 'First human message' },
++        { name: 'Character', is_user: false, mes: 'First reply' },
++    ]);
++    assert.equal(imported[1][1].mes, 'Second history');
++    assert.equal(imported[2].length, 1);
++    await assert.rejects(fs.stat(upload), { code: 'ENOENT' });
++});
++
++test('repeated JSONL HTTP imports cannot overwrite an earlier import in the same millisecond', async (t) => {
++    const { characterDirectory, importChat } = await setup(t);
++    t.mock.method(Date, 'now', () => 1767225600000);
++    const contents = message => [{ chat_metadata: {} }, { name: 'Character', mes: message }].map(value => JSON.stringify(value)).join('\n');
++    const first = await importChat(contents('First imported chat'), 'jsonl');
++    const second = await importChat(contents('Second imported chat'), 'jsonl');
++    assert.equal(first.res, true);
++    assert.equal(second.res, true);
++    assert.notEqual(first.fileNames[0], second.fileNames[0]);
++    assert.equal(await fs.readFile(path.join(characterDirectory, first.fileNames[0]), 'utf8'), contents('First imported chat'));
++    assert.equal(await fs.readFile(path.join(characterDirectory, second.fileNames[0]), 'utf8'), contents('Second imported chat'));
++});
++
++test('group HTTP imports preserve existing chats and repeated imports at the same timestamp', async (t) => {
++    const { groupChats, upload, importGroupChat } = await setup(t);
++    const timestamp = 1767225600000;
++    t.mock.method(Date, 'now', () => timestamp);
++    const existing = path.join(groupChats, `${humanizedDateTime(timestamp)}.jsonl`);
++    await fs.writeFile(existing, 'existing group chat');
++    const contents = message => [{ chat_metadata: {} }, { name: 'Character', mes: message }].map(value => JSON.stringify(value)).join('\n');
++    const first = await importGroupChat(contents('First group import'));
++    const second = await importGroupChat(contents('Second group import'));
++    assert.equal(typeof first.res, 'string');
++    assert.equal(typeof second.res, 'string');
++    assert.notEqual(first.res, second.res);
++    assert.equal((await fs.readdir(groupChats)).length, 3);
++    assert.equal(await fs.readFile(existing, 'utf8'), 'existing group chat');
++    assert.equal(await fs.readFile(path.join(groupChats, `${first.res}.jsonl`), 'utf8'), contents('First group import'));
++    assert.equal(await fs.readFile(path.join(groupChats, `${second.res}.jsonl`), 'utf8'), contents('Second group import'));
++    await assert.rejects(fs.stat(upload), { code: 'ENOENT' });
++});
+diff --git a/tests/chat-info-cache.node.mjs b/tests/chat-info-cache.node.mjs
+new file mode 100644
+index 00000000..35e6eab7
+--- /dev/null
++++ b/tests/chat-info-cache.node.mjs
+@@ -0,0 +1,218 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++import fs from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++import { Readable } from 'node:stream';
++import { ChatInfoCache } from '../src/chat-info-cache.js';
++
++process.env.SILLYTAVERN_BACKUPS_CHAT_ENABLED = 'false';
++process.env.SILLYTAVERN_BACKUPS_CHAT_MAXTOTALBACKUPS = '-1';
++process.env.SILLYTAVERN_BACKUPS_CHAT_THROTTLEINTERVAL = '0';
++process.env.SILLYTAVERN_BACKUPS_CHAT_CHECKINTEGRITY = 'true';
++const { createChatSearchMatcher, getChatInfo } = await import('../src/endpoints/chats.js');
++
++function jsonl(message = 'First message', metadata = { note: 'original' }) {
++    return [
++        { chat_metadata: metadata },
++        { name: 'Character', mes: message, send_date: '2026-01-01' },
++    ].map(value => JSON.stringify(value)).join('\n');
++}
++
++async function fixture(t, count = 1) {
++    const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'st-info-cache-'));
++    t.after(() => fs.promises.rm(root, { recursive: true, force: true }));
++    const files = Array.from({ length: count }, (_, i) => path.join(root, `${i}.jsonl`));
++    await Promise.all(files.map(file => fs.promises.writeFile(file, jsonl())));
++    return files;
++}
++
++function countStreams(t) {
++    const original = fs.createReadStream;
++    const counts = { total: 0, active: 0, peak: 0 };
++    t.mock.method(fs, 'createReadStream', (...args) => {
++        counts.total++;
++        counts.peak = Math.max(counts.peak, ++counts.active);
++        const stream = original(...args);
++        stream.once('close', () => counts.active--);
++        return stream;
++    });
++    return counts;
++}
++
++test('unchanged summaries avoid content reads and isolate caller data and metadata', async (t) => {
++    const [file] = await fixture(t);
++    const counts = countStreams(t);
++    const first = await getChatInfo(file, { avatar: 'first.png' }, true);
++    first.chat_metadata.note = 'mutated by caller';
++    const second = await getChatInfo(file, { group: 'second' }, true);
++    assert.equal(counts.total, 1);
++    assert.equal(second.chat_metadata.note, 'original');
++    assert.equal(second.group, 'second');
++    assert.equal(second.avatar, undefined);
++    assert.equal(first.group, undefined);
++
++    const withoutMetadata = await getChatInfo(file);
++    assert.equal(withoutMetadata.chat_metadata, undefined);
++    await getChatInfo(file);
++    assert.equal(counts.total, 2);
++});
++
++test('simultaneous summaries share one scan without sharing mutable metadata', async (t) => {
++    const [file] = await fixture(t);
++    const counts = countStreams(t);
++    const summaries = await Promise.all(Array.from({ length: 20 }, () => getChatInfo(file, {}, true)));
++    assert.equal(counts.total, 1);
++    summaries[0].chat_metadata.note = 'changed';
++    assert.ok(summaries.slice(1).every(summary => summary.chat_metadata.note === 'original'));
++});
++
++test('same names in different user directories cannot share a summary', async (t) => {
++    const [first] = await fixture(t);
++    const [second] = await fixture(t);
++    await fs.promises.writeFile(second, jsonl('Another user'));
++    assert.equal((await getChatInfo(first)).mes, 'First message');
++    assert.equal((await getChatInfo(second)).mes, 'Another user');
++});
++
++test('edits, atomic replacement, rename, deletion and recreation invalidate summaries', async (t) => {
++    const [file] = await fixture(t);
++    await getChatInfo(file);
++    const previous = await fs.promises.stat(file);
++    await fs.promises.writeFile(file, jsonl('Other message'));
++    await fs.promises.utimes(file, previous.atime, previous.mtime);
++    assert.equal((await getChatInfo(file)).mes, 'Other message');
++
++    const replacement = `${file}.replacement`;
++    await fs.promises.writeFile(replacement, jsonl('Third message'));
++    await fs.promises.utimes(replacement, previous.atime, previous.mtime);
++    await fs.promises.rename(replacement, file);
++    assert.equal((await getChatInfo(file)).mes, 'Third message');
++
++    const renamed = `${file}.renamed`;
++    await fs.promises.rename(file, renamed);
++    assert.deepEqual(await getChatInfo(file), { match: false });
++    assert.equal((await getChatInfo(renamed)).file_name, path.basename(renamed));
++    await fs.promises.writeFile(file, jsonl('Recreated message'));
++    assert.equal((await getChatInfo(file)).mes, 'Recreated message');
++    await fs.promises.unlink(file);
++    assert.deepEqual(await getChatInfo(file), { match: false });
++});
++
++test('searches always inspect content independently of cached previews and each other', async (t) => {
++    const [file] = await fixture(t);
++    const counts = countStreams(t);
++    await getChatInfo(file);
++    const [matching, absent] = await Promise.all([
++        getChatInfo(file, {}, false, createChatSearchMatcher(['first'])),
++        getChatInfo(file, {}, false, createChatSearchMatcher(['missing'])),
++    ]);
++    assert.equal(matching.match, true);
++    assert.equal(absent.match, false);
++    assert.equal((await getChatInfo(file)).match, true);
++    assert.equal(counts.total, 3);
++});
++
++test('large directory requests keep at most eight streams open and close every descriptor', async (t) => {
++    const files = await fixture(t, 80);
++    const counts = countStreams(t);
++    const results = await Promise.all(files.map(file => getChatInfo(file)));
++    assert.equal(results.length, 80);
++    assert.ok(results.every(summary => summary.chat_items === 1));
++    assert.equal(counts.total, 80);
++    assert.ok(counts.peak <= 8, `Opened ${counts.peak} simultaneous streams`);
++    assert.equal(counts.active, 0);
++});
++
++test('stat identity detects same-size edits even when the mtime is preserved', () => {
++    const base = { dev: 1, ino: 2, size: 3, mtimeMs: 4, ctimeMs: 5 };
++    for (const key of Object.keys(base)) {
++        assert.notEqual(ChatInfoCache.version(base), ChatInfoCache.version({ ...base, [key]: 10 }));
++    }
++});
++
++test('a file changed during a scan is not cached under the old or the new version', async (t) => {
++    const [file] = await fixture(t);
++    const cache = new ChatInfoCache();
++    const oldStats = await fs.promises.stat(file);
++    let reads = 0;
++    const first = await cache.read(file, oldStats, false, async () => {
++        reads++;
++        await fs.promises.writeFile(file, jsonl('changed while reading'));
++        return { mes: 'mixed content' };
++    });
++    assert.equal(first.mes, 'mixed content');
++    const newStats = await fs.promises.stat(file);
++    const second = await cache.read(file, newStats, false, async () => {
++        reads++;
++        return { mes: 'correct content' };
++    });
++    assert.equal(second.mes, 'correct content');
++    assert.equal(reads, 2);
++});
++
++test('failed and vanished reads are not cached and release the queue slot', async (t) => {
++    const [file] = await fixture(t);
++    const cache = new ChatInfoCache({ concurrency: 1 });
++    const stats = await fs.promises.stat(file);
++    const denied = Object.assign(new Error('permission denied'), { code: 'EACCES' });
++    await assert.rejects(cache.read(file, stats, false, async () => { throw denied; }), denied);
++    assert.equal(await cache.read(file, stats, false, async () => null), null);
++    assert.deepEqual(await cache.read(file, stats, false, async () => ({ mes: 'recovered' })), { mes: 'recovered' });
++});
++
++test('stream failures reject the scan, close the stream and allow a later retry', async (t) => {
++    const [file] = await fixture(t);
++    const denied = Object.assign(new Error('permission denied'), { code: 'EACCES' });
++    const stream = new Readable({ read() { this.destroy(denied); } });
++    const mocked = t.mock.method(fs, 'createReadStream', () => stream);
++    await assert.rejects(getChatInfo(file), denied);
++    assert.equal(stream.closed, true);
++    mocked.mock.restore();
++    assert.equal((await getChatInfo(file)).mes, 'First message');
++});
++
++test('cache evicts the least recently used summary at the entry limit', async (t) => {
++    const files = await fixture(t, 3);
++    const cache = new ChatInfoCache({ maxEntries: 2 });
++    const reads = [0, 0, 0];
++    const read = async (index) => cache.read(files[index], await fs.promises.stat(files[index]), false, async () => {
++        reads[index]++;
++        return { mes: String(index) };
++    });
++    await read(0);
++    await read(1);
++    await read(0);
++    await read(2);
++    await read(0);
++    await read(1);
++    assert.deepEqual(reads, [1, 2, 1]);
++});
++
++test('byte limits evict summaries and oversized entries bypass retention', async (t) => {
++    const files = await fixture(t, 2);
++    const stats = await Promise.all(files.map(file => fs.promises.stat(file)));
++    const summary = { mes: 'x'.repeat(200) };
++    const entryBytes = (JSON.stringify([path.resolve(files[0]), false]).length
++        + ChatInfoCache.version(stats[0]).length + JSON.stringify(summary).length) * 2;
++    const cache = new ChatInfoCache({ maxBytes: entryBytes + 40, maxEntryBytes: entryBytes + 40 });
++    let reads = 0;
++    const read = (index) => cache.read(files[index], stats[index], false, async () => {
++        reads++;
++        return summary;
++    });
++    await read(0);
++    await read(1);
++    await read(0);
++    assert.equal(reads, 3);
++
++    const small = new ChatInfoCache({ maxEntryBytes: 100 });
++    let oversizedReads = 0;
++    const oversized = () => small.read(files[0], stats[0], false, async () => {
++        oversizedReads++;
++        return summary;
++    });
++    await oversized();
++    await oversized();
++    assert.equal(oversizedReads, 2);
++});
+diff --git a/tests/chat-search.node.mjs b/tests/chat-search.node.mjs
+index c6a56a93..3f72ade4 100644
+--- a/tests/chat-search.node.mjs
++++ b/tests/chat-search.node.mjs
+@@ -97,3 +97,28 @@ test('search route isolates chat matches and retains independent filename matchi
+     );
+     assert.deepEqual(result.map(item => item.file_name).sort(), ['alpha beta', 'both']);
+ });
++
++test('a disconnected search stops scanning after the current file', async (t) => {
++    const root = await directory(t);
++    const character = path.join(root, 'Character');
++    await fs.mkdir(character);
++    for (const name of ['first', 'second', 'third']) {
++        await fs.writeFile(path.join(character, `${name}.jsonl`), jsonl(['alpha']));
++    }
++    const response = {
++        destroyed: false,
++        send() { assert.fail('A disconnected client must not receive a response'); },
++        status(code) { throw new Error(`Unexpected status ${code}`); },
++    };
++    const stat = fs.stat;
++    let inspectedFiles = 0;
++    t.mock.method(fs, 'stat', async (...args) => {
++        inspectedFiles++;
++        const result = await stat(...args);
++        response.destroyed = true;
++        return result;
++    });
++    const handler = router.stack.find(layer => layer.route?.path === '/search').route.stack.at(-1).handle;
++    await handler({ body: { query: 'alpha', avatar_url: 'Character.png' }, user: { directories: { chats: root } } }, response);
++    assert.equal(inspectedFiles, 1);
++});

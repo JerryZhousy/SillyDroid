@@ -2,6 +2,13 @@
   "build": {
     "tavernVersion": "latest",
     "buildType": "release",
+    "tavernSourcePatches": {
+      "enabled": true,
+      "setId": "shalistera-sillytavern-1.19.0",
+      "baseTag": "1.19.0",
+      "path": "patches/tavern/1.19.0",
+      "required": true
+    },
     "termuxPackages": [
       "git",
       "nodejs-lts",

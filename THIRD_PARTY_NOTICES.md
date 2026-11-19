@@ -12,6 +12,13 @@
 - 用途：作为 Android 宿主打包流程中的上游 Tavern server source 与最终 server payload 来源。
 - 许可证：AGPL-3.0
 
+### SillyTavern 源码补丁集（shalistera/sillytavern）
+
+- 项目地址：https://github.com/shalistera/sillytavern
+- 用途：`patches/tavern/1.19.0` 中的 31 个补丁来自该 fork（基点 `06bde93`，补丁集 head `f67e000`），在 stage 3 于 `npm ci` 之前应用到上游 tag `1.19.0` 源码上。
+- 许可证：AGPL-3.0（与上游 SillyTavern 相同）；补丁集元数据见 `patches/tavern/1.19.0/series.json`。
+- 说明：该 fork 的提交为上游未合并的第三方改动，本仓库仅按上述许可在打包流程中应用，不对其正确性作额外担保；如不需要，可通过 `build.tavernSourcePatches.enabled=false` 或 `--no-patches` 关闭。
+
 ### Termux 生态运行时资源
 
 - 项目地址：https://github.com/termux/termux-packages

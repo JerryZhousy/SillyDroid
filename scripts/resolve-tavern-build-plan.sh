@@ -338,6 +338,21 @@ fi
 normalized_tag="${tavern_tag#refs/tags/}"
 safe_tag="$(sanitize_tag "$normalized_tag")"
 
+# 源码补丁集：只影响 stage 3 的源码内容，不改变 artifact / release 命名，
+# 免得 App 端按 tavern-server-source-linux-arm64-<tag> 解析源码包时对不上。
+patch_set_enabled="$(read_build_config_value 'build.tavernSourcePatches.enabled' 'false')"
+patch_set_id="$(read_build_config_value 'build.tavernSourcePatches.setId' '')"
+patch_base_tag="$(read_build_config_value 'build.tavernSourcePatches.baseTag' "$normalized_tag")"
+patch_set_path="$(read_build_config_value 'build.tavernSourcePatches.path' "patches/tavern/$patch_base_tag")"
+patch_required="$(read_build_config_value 'build.tavernSourcePatches.required' 'false')"
+
+# patch_applies 表示「这次构建应该真的打上补丁」：启用且 baseTag 与目标 tag 一致。
+# baseTag 不一致时 stage 3 会跳过补丁，CI 需要用 patch_applies 校验 manifest，避免误判。
+patch_applies='false'
+if [[ "$patch_set_enabled" == 'true' && "$patch_base_tag" == "$normalized_tag" ]]; then
+    patch_applies='true'
+fi
+
 host_version_base="$(sed -n 's/^staiAndroidHostVersion=//p' "$gradle_properties_path" | head -n 1 | tr -d '\r' | tr -d '[:space:]')"
 if [[ -z "$host_version_base" ]]; then
     echo '无法解析 Android 宿主版本基线。' >&2
@@ -355,7 +370,7 @@ if [[ -z "$current_head_sha" ]]; then
 fi
 
 repo_slug="$(resolve_current_repo_slug)"
-mapfile -t apk_release_state < <(resolve_apk_release_state "$host_version_base" "$safe_tag" "$build_type" "$current_head_sha" "$repo_slug")
+mapfile -t apk_release_state < <(resolve_apk_release_state "$host_version_base" "$safe_tag" "$build_type" "$current_head_sha" "$repo_slug" | tr -d '\r')
 
 if [[ "${#apk_release_state[@]}" -lt 2 ]]; then
     echo '无法解析 APK 发布版本计数。' >&2
@@ -383,9 +398,12 @@ if [[ -n "$compare_base" && "$compare_base" != '00000000000000000000000000000000
         dependency_changed='true'
     fi
 
-    # Stage 3 server source is keyed only by the requested upstream Tavern tag.
-    # Host scripts, runtime patches, overlays, and build helpers belong to stage 4
-    # so they must not invalidate an existing server-source prerequisite.
+    # Stage 3 server source 由「上游 Tavern tag + 源码补丁集」共同决定。
+    # 补丁目录、补丁集元数据或 stage 3 脚本自身变化，都必须让已发布的 server source 失效重建。
+    # 宿主脚本、runtime patch、overlay 仍属于 stage 4，不应让 server source 失效。
+    if printf '%s\n' "$changed_files" | grep -E '^(patches/|scripts/sync-tavern-android-bootstrap\.sh$)' >/dev/null 2>&1; then
+        server_changed='true'
+    fi
 
     if printf '%s\n' "$changed_files" | grep -E '^(android-tavern/|gradle/|gradlew|gradlew\.bat|scripts/(android-build-common\.sh|build-tavern-android-apk\.sh)|sillydroid-build-config\.json|\.github/workflows/sillydroid-upstream-apk\.yml)' >/dev/null 2>&1; then
         apk_changed='true'
@@ -427,6 +445,12 @@ emit rootfs_changed "$rootfs_changed"
 emit dependency_changed "$dependency_changed"
 emit server_changed "$server_changed"
 emit apk_changed "$apk_changed"
+emit patch_set_enabled "$patch_set_enabled"
+emit patch_applies "$patch_applies"
+emit patch_set_id "$patch_set_id"
+emit patch_base_tag "$patch_base_tag"
+emit patch_set_path "$patch_set_path"
+emit patch_required "$patch_required"
 emit rootfs_release_tag "$rootfs_release_tag"
 emit rootfs_release_title "$rootfs_release_title"
 emit rootfs_asset_name "$rootfs_asset_name"

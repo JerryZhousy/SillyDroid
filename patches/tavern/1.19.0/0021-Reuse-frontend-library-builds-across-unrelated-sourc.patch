@@ -1,0 +1,312 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Thu, 22 Oct 2026 20:41:03 +0900
+Subject: [PATCH 21/31] Reuse frontend library builds across unrelated source
+ updates
+
+---
+ tests/bench-webpack-cache.mjs        | 44 +++++++++++++++
+ tests/util/webpack-cache-fixture.mjs | 82 ++++++++++++++++++++++++++++
+ tests/webpack-cache.node.mjs         | 82 ++++++++++++++++++++++++++++
+ webpack.config.js                    | 37 ++++++++++---
+ 4 files changed, 238 insertions(+), 7 deletions(-)
+ create mode 100644 tests/bench-webpack-cache.mjs
+ create mode 100644 tests/util/webpack-cache-fixture.mjs
+ create mode 100644 tests/webpack-cache.node.mjs
+
+diff --git a/tests/bench-webpack-cache.mjs b/tests/bench-webpack-cache.mjs
+new file mode 100644
+index 00000000..5bb7fc80
+--- /dev/null
++++ b/tests/bench-webpack-cache.mjs
+@@ -0,0 +1,44 @@
++import assert from 'node:assert/strict';
++import fs from 'node:fs/promises';
++import { execFileSync } from 'node:child_process';
++import { fileURLToPath } from 'node:url';
++import { createWebpackCacheFixture, compileWebpackFixture } from './util/webpack-cache-fixture.mjs';
++
++const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
++const baseline = process.env.ST_WEBPACK_BASELINE || 'bebe62bda';
++const rounds = Number(process.env.BENCHMARK_ROUNDS || 2);
++if (!Number.isInteger(rounds) || rounds < 1 || rounds > 10) throw new Error('BENCHMARK_ROUNDS must be between 1 and 10');
++const gitOptions = { cwd: repositoryRoot, encoding: 'utf8' };
++const baselineCommit = execFileSync('git', ['rev-parse', '--verify', '--end-of-options', `${baseline}^{commit}`], gitOptions).trim();
++const baselineSource = execFileSync('git', ['show', `${baselineCommit}:webpack.config.js`], gitOptions);
++const currentSource = await fs.readFile(new URL('../webpack.config.js', import.meta.url), 'utf8');
++const fixtures = {};
++const results = [];
++const initialOutputs = {};
++try {
++    for (const [version, source] of [['baseline', baselineSource], ['current', currentSource]]) {
++        fixtures[version] = await createWebpackCacheFixture(source, { realLibraries: true });
++        const result = await compileWebpackFixture(await fixtures[version].config());
++        initialOutputs[version] = result.output;
++        results.push({ version, phase: 'initial', elapsedMs: result.elapsedMs, builtModules: result.builtModules });
++        console.log(JSON.stringify(results.at(-1)));
++    }
++    assert.equal(initialOutputs.current, initialOutputs.baseline, 'both configs must emit the same application library');
++    for (let round = 0; round < rounds; round++) {
++        for (const version of round % 2 ? ['baseline', 'current'] : ['current', 'baseline']) {
++            const fixture = fixtures[version];
++            // The legacy config reads this revision through its normal getVersion
++            // call. The build inputs and dependency tree stay unchanged.
++            await fixture.write('revision', `unrelated-commit-${round}`);
++            await fixture.write('public/unrelated.js', `export const unrelatedChange = ${round};\n`);
++            const result = await compileWebpackFixture(await fixture.config());
++            assert.equal(result.output, initialOutputs[version]);
++            results.push({ version, phase: 'unrelated-commit', round, elapsedMs: result.elapsedMs, builtModules: result.builtModules });
++            console.log(JSON.stringify(results.at(-1)));
++        }
++    }
++    const report = { baseline, baselineCommit, rounds, node: process.version, results };
++    await fs.writeFile(process.env.BENCHMARK_OUTPUT || '/tmp/csillytavern-webpack-cache-benchmark.json', JSON.stringify(report, null, 2));
++} finally {
++    for (const fixture of Object.values(fixtures)) await fixture.cleanup();
++}
+diff --git a/tests/util/webpack-cache-fixture.mjs b/tests/util/webpack-cache-fixture.mjs
+new file mode 100644
+index 00000000..820866d4
+--- /dev/null
++++ b/tests/util/webpack-cache-fixture.mjs
+@@ -0,0 +1,82 @@
++import fs from 'node:fs/promises';
++import os from 'node:os';
++import path from 'node:path';
++import { fileURLToPath, pathToFileURL } from 'node:url';
++import webpack from 'webpack';
++
++const repositoryRoot = fileURLToPath(new URL('../../', import.meta.url));
++
++/** Create an isolated project using the application's actual Webpack config. */
++export async function createWebpackCacheFixture(configSource, { realLibraries = false } = {}) {
++    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'st-webpack-cache-'));
++    try {
++        await fs.mkdir(path.join(root, 'src'));
++        await fs.mkdir(path.join(root, 'public'));
++        await fs.symlink(path.join(repositoryRoot, 'node_modules'), path.join(root, 'node_modules'), 'junction');
++        await fs.writeFile(path.join(root, 'webpack.config.js'), configSource);
++        await fs.writeFile(path.join(root, 'src/server-directory.js'), `export const serverDirectory = ${JSON.stringify(root)};\n`);
++        await fs.writeFile(path.join(root, 'src/util.js'), `
++            import fs from 'node:fs';
++            export const color = { yellow: x => x, red: x => x };
++            export async function getVersion() {
++                return { pkgVersion: '1.0.0', gitRevision: fs.readFileSync(new URL('../revision', import.meta.url), 'utf8') };
++            }
++        `);
++        await fs.writeFile(path.join(root, 'revision'), 'first-commit');
++        if (realLibraries) {
++            for (const name of ['package.json', 'package-lock.json', 'public/lib.js']) {
++                await fs.copyFile(path.join(repositoryRoot, name), path.join(root, name));
++            }
++        } else {
++            await fs.writeFile(path.join(root, 'package.json'), '{"name":"webpack-cache-fixture","version":"1.0.0","type":"module"}\n');
++            await fs.writeFile(path.join(root, 'package-lock.json'), '{"lockfileVersion":3}\n');
++            await fs.writeFile(path.join(root, 'public/lib.js'), 'export { value } from "./dependency.js";\n');
++            await fs.writeFile(path.join(root, 'public/dependency.js'), 'export const value = "initial dependency";\n');
++        }
++        let generation = 0;
++        return {
++            root,
++            async config(options = {}) {
++                const url = pathToFileURL(path.join(root, 'webpack.config.js'));
++                url.searchParams.set('generation', String(generation++));
++                const { default: getConfig } = await import(url.href);
++                const previousCwd = process.cwd();
++                try {
++                    process.chdir(root);
++                    const config = getConfig({ forceDist: true, ...options });
++                    config.context ??= root;
++                    return config;
++                } finally {
++                    process.chdir(previousCwd);
++                }
++            },
++            async write(file, content) {
++                await fs.writeFile(path.join(root, file), content);
++            },
++            async cleanup() {
++                await fs.rm(root, { recursive: true, force: true });
++            },
++        };
++    } catch (error) {
++        await fs.rm(root, { recursive: true, force: true });
++        throw error;
++    }
++}
++
++/** Run and close the real compiler, including persisting its filesystem cache. */
++export async function compileWebpackFixture(config) {
++    const start = performance.now();
++    const compiler = webpack(config);
++    const stats = await new Promise((resolve, reject) => {
++        compiler.run((error, stats) => {
++            compiler.close(closeError => {
++                if (error || closeError) return reject(error || closeError);
++                if (stats.hasErrors()) return reject(new Error(stats.toString({ all: false, errors: true })));
++                resolve(stats);
++            });
++        });
++    });
++    const modules = stats.toJson({ all: false, modules: true, cachedModules: true }).modules;
++    const output = await fs.readFile(path.join(config.output.path, config.output.filename), 'utf8');
++    return { elapsedMs: performance.now() - start, builtModules: modules.filter(module => module.built).length, output };
++}
+diff --git a/tests/webpack-cache.node.mjs b/tests/webpack-cache.node.mjs
+new file mode 100644
+index 00000000..8a8a6b14
+--- /dev/null
++++ b/tests/webpack-cache.node.mjs
+@@ -0,0 +1,82 @@
++import assert from 'node:assert/strict';
++import fs from 'node:fs/promises';
++import path from 'node:path';
++import { pathToFileURL } from 'node:url';
++import test from 'node:test';
++import { createWebpackCacheFixture, compileWebpackFixture } from './util/webpack-cache-fixture.mjs';
++
++const configSource = await fs.readFile(new URL('../webpack.config.js', import.meta.url), 'utf8');
++
++async function setup(t) {
++    const fixture = await createWebpackCacheFixture(configSource);
++    t.after(() => fixture.cleanup());
++    return fixture;
++}
++
++test('unrelated commits retain the compiled library cache and identical output', async t => {
++    const fixture = await setup(t);
++    const firstConfig = await fixture.config();
++    const first = await compileWebpackFixture(firstConfig);
++    await fixture.write('revision', 'unrelated-performance-commit');
++    await fixture.write('public/unrelated.js', 'export const unrelated = true;\n');
++    const secondConfig = await fixture.config({ pruneCache: true });
++    assert.equal(secondConfig.output.path, firstConfig.output.path);
++    const second = await compileWebpackFixture(secondConfig);
++    assert.equal(second.output, first.output);
++    assert.ok(first.builtModules > 0);
++    assert.equal(second.builtModules, 0, 'the real compiler should reuse all unchanged modules');
++});
++
++test('edits to an imported module rebuild it without a lockfile or entry change', async t => {
++    const fixture = await setup(t);
++    const initialConfig = await fixture.config();
++    await compileWebpackFixture(initialConfig);
++    await fixture.write('public/dependency.js', 'export const value = "edited dependency with a new length";\n');
++    const nextConfig = await fixture.config();
++    assert.equal(nextConfig.output.path, initialConfig.output.path);
++    const updated = await compileWebpackFixture(nextConfig);
++    assert.ok(updated.builtModules > 0);
++    const url = pathToFileURL(path.join(nextConfig.output.path, nextConfig.output.filename));
++    assert.equal((await import(url.href)).value, 'edited dependency with a new length');
++});
++
++test('entry, lockfile, package and build config changes each invalidate the output namespace', async t => {
++    const fixture = await setup(t);
++    let previous = await fixture.config();
++    for (const [name, content] of [
++        ['public/lib.js', 'export const changedEntry = true;\n'],
++        ['package-lock.json', '{"lockfileVersion":3,"packages":{}}\n'],
++        ['npm-shrinkwrap.json', '{"lockfileVersion":3,"packages":{}}\n'],
++        ['yarn.lock', '# yarn lockfile v1\n'],
++        ['pnpm-lock.yaml', 'lockfileVersion: 9\n'],
++        ['package.json', '{"name":"webpack-cache-fixture","version":"1.0.1","type":"module"}\n'],
++        ['webpack.config.js', configSource + '\n// updated build configuration\n'],
++    ]) {
++        await fixture.write(name, content);
++        const next = await fixture.config();
++        assert.notEqual(next.output.path, previous.output.path, name);
++        previous = next;
++    }
++});
++
++test('installations without an npm lockfile can still build and later detect one', async t => {
++    const fixture = await setup(t);
++    await fs.unlink(path.join(fixture.root, 'package-lock.json'));
++    const withoutLock = await fixture.config();
++    await compileWebpackFixture(withoutLock);
++    await fixture.write('package-lock.json', '{"lockfileVersion":3}\n');
++    assert.notEqual((await fixture.config()).output.path, withoutLock.output.path);
++});
++
++test('pruning removes outdated builds and preserves the current cache', async t => {
++    const fixture = await setup(t);
++    const initial = await fixture.config();
++    await compileWebpackFixture(initial);
++    await fixture.write('public/lib.js', 'export const updatedEntry = true;\n');
++    const updated = await fixture.config({ pruneCache: true });
++    assert.notEqual(updated.output.path, initial.output.path);
++    await assert.rejects(fs.access(initial.output.path), { code: 'ENOENT' });
++    await compileWebpackFixture(updated);
++    await fixture.config({ pruneCache: true });
++    await fs.access(updated.output.path);
++});
+diff --git a/webpack.config.js b/webpack.config.js
+index 2d2fcf3e..b4524fa9 100644
+--- a/webpack.config.js
++++ b/webpack.config.js
+@@ -2,19 +2,41 @@ import process from 'node:process';
+ import path from 'node:path';
+ import fs from 'node:fs';
+ import crypto from 'node:crypto';
++import { fileURLToPath } from 'node:url';
+ import isDocker from 'is-docker';
+ import webpack from 'webpack';
+ import { serverDirectory } from './src/server-directory.js';
+-import { getVersion, color } from './src/util.js';
++import { color } from './src/util.js';
++
++const configFile = fileURLToPath(import.meta.url);
++let webpackCacheVersion;
+ 
+ /**
+- * Generate a cache version string based on the application version, Git revision, and Webpack version.
++ * Identify the library build inputs, independently of unrelated Git commits.
++ * Webpack also validates imported modules using its normal filesystem snapshots.
+  * @returns {string} The cache version string.
+  */
+ function getWebpackCacheVersion() {
+-    return crypto.createHash('shake256', { outputLength: 8 })
+-        .update(JSON.stringify([appVersion.pkgVersion, appVersion.gitRevision, webpack.version]))
+-        .digest('hex');
++    if (webpackCacheVersion) {
++        return webpackCacheVersion;
++    }
++
++    const hash = crypto.createHash('shake256', { outputLength: 8 })
++        .update(JSON.stringify([webpack.version, process.versions.node]));
++    const buildInputs = [configFile, 'public/lib.js', 'package.json', 'package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml'];
++    for (const file of buildInputs) {
++        const filePath = path.resolve(serverDirectory, file);
++        // Optional lockfiles cover installations using other package managers.
++        // Delimit each input so changing file boundaries cannot share a hash.
++        if (fs.existsSync(filePath)) {
++            const contents = fs.readFileSync(filePath);
++            hash.update(`file:${contents.length}\0`).update(contents);
++        } else {
++            hash.update('missing\0');
++        }
++    }
++    webpackCacheVersion = hash.digest('hex');
++    return webpackCacheVersion;
+ }
+ 
+ /**
+@@ -48,8 +70,6 @@ function pruneWebpackCache(webpackRoot, currentCacheVersion) {
+     }
+ }
+ 
+-const appVersion = await getVersion();
+-
+ /**
+  * Get the Webpack configuration for the public/lib.js file.
+  * 1. Docker has got cache and the output file pre-baked.
+@@ -98,6 +118,9 @@ export default function getPublicLibConfig({ forceDist = false, pruneCache = fal
+             cacheDirectory: cacheDirectory,
+             store: 'pack',
+             compression: 'gzip',
++            buildDependencies: {
++                config: [configFile],
++            },
+         },
+         devtool: false,
+         watch: false,

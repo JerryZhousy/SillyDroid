@@ -1,0 +1,333 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Thu, 22 Oct 2026 20:42:20 +0900
+Subject: [PATCH 22/31] Skip unused macro parsing for plain text while
+ preserving processors
+
+---
+ public/scripts/macros.js                    |   9 ++
+ public/scripts/macros/engine/MacroEngine.js |   6 +
+ tests/bench-macros.mjs                      | 126 +++++++++++++++++
+ tests/frontend/MacroPlainText.e2e.js        | 143 ++++++++++++++++++++
+ 4 files changed, 284 insertions(+)
+ create mode 100644 tests/bench-macros.mjs
+ create mode 100644 tests/frontend/MacroPlainText.e2e.js
+
+diff --git a/public/scripts/macros.js b/public/scripts/macros.js
+index cbe17426..aed4b64c 100644
+--- a/public/scripts/macros.js
++++ b/public/scripts/macros.js
+@@ -635,6 +635,15 @@ export function evaluateMacros(content, env, postProcessFn) {
+         { regex: /{{input}}/gi, replace: () => String($('#send_textarea').val()) },
+     ];
+ 
++    // Plain regex replacements and ordinary chat text have no macros to run.
++    // Keep the environment reads above, registered values, and chat hash setup
++    // observable to callers, without compiling unused patterns or hashing text.
++    if (typeof content === 'string' && !content.includes('{{') && !/<(?:USER|BOT|CHAR|CHARIFNOTGROUP|GROUP)>/i.test(content)) {
++        getChatIdHash();
++        MacrosParser.populateEnv(env);
++        return content;
++    }
++
+     /**
+      * Built-ins running after the env variables
+      * @type {Macro[]}
+diff --git a/public/scripts/macros/engine/MacroEngine.js b/public/scripts/macros/engine/MacroEngine.js
+index 7c7536e0..0615f5cc 100644
+--- a/public/scripts/macros/engine/MacroEngine.js
++++ b/public/scripts/macros/engine/MacroEngine.js
+@@ -122,6 +122,12 @@ class MacroEngine {
+ 
+         const preProcessed = this.#runPreProcessors(input, safeEnv);
+ 
++        // Processors can introduce macros or transform plain text. Run both
++        // stages even when the processed text needs no lexer/parser traversal.
++        if (typeof preProcessed === 'string' && preProcessed.length > 0 && !preProcessed.includes('{{')) {
++            return this.#runPostProcessors(preProcessed, safeEnv);
++        }
++
+         const { cst, lexingErrors, parserErrors } = MacroParser.parseDocument(preProcessed);
+ 
+         // For now, we log and still try to process what we can.
+diff --git a/tests/bench-macros.mjs b/tests/bench-macros.mjs
+new file mode 100644
+index 00000000..0a273196
+--- /dev/null
++++ b/tests/bench-macros.mjs
+@@ -0,0 +1,126 @@
++import assert from 'node:assert/strict';
++import { chromium } from '@playwright/test';
++import { execFileSync } from 'node:child_process';
++import { testSetup } from './frontend/frontent-test-utils.js';
++
++const baseURL = process.env.ST_BASE_URL || 'http://127.0.0.1:18349';
++const baseline = process.env.ST_MACRO_BASELINE || 'bebe62bda';
++const checkOnly = process.env.ST_MACRO_CHECK_ONLY === '1';
++const sources = ['scripts/macros.js', 'scripts/macros/engine/MacroEngine.js'].map(file => [file, execFileSync('git', ['show', `${baseline}:public/${file}`], { encoding: 'utf8' })]);
++const browser = await chromium.launch();
++const results = [];
++try {
++    for (const implementation of (checkOnly ? ['baseline', 'current'] : ['baseline', 'current', 'current', 'baseline'])) {
++        const page = await browser.newPage({ baseURL });
++        if (implementation === 'baseline') {
++            for (const [file, body] of sources) {
++                await page.route(`**/${file}`, route => route.fulfill({ contentType: 'application/javascript', body }));
++            }
++        }
++        await page.route('**/api/settings/get', async route => {
++            const response = await route.fetch();
++            const data = await response.json();
++            const settings = JSON.parse(data.settings);
++            settings.firstRun = false;
++            data.settings = JSON.stringify(settings);
++            await route.fulfill({ response, json: data });
++        });
++        await page.route('**/api/settings/save', route => route.fulfill({ json: { result: 'ok' } }));
++        await testSetup.awaitST({ page });
++        await page.locator('#chat .mes[type="welcome_prompt"]').waitFor();
++        const result = await page.evaluate(async ({ checkOnly }) => {
++            const st = await import('/script.js');
++            const { evaluateMacros, MacrosParser } = await import('/scripts/macros.js');
++            const { macros } = await import('/scripts/macros/macro-system.js');
++            const { power_user } = await import('/scripts/power-user.js');
++            const { runRegexScript } = await import('/scripts/extensions/regex/engine.js');
++            const rows = [];
++            const measure = (name, iterations, callback) => {
++                if (checkOnly) return;
++                for (let index = 0; index < 20; index++) callback();
++                const start = performance.now();
++                for (let index = 0; index < iterations; index++) callback();
++                rows.push({ name, iterations, ms: +(performance.now() - start).toFixed(2) });
++            };
++            const env = Object.fromEntries(Array.from({ length: 30 }, (_, index) => [`macro${index}`, 'example']));
++            for (const size of [32, 4096, 32768, 131072]) {
++                const text = 'The traveler walked through the quiet forest. '.repeat(Math.ceil(size / 45)).slice(0, size);
++                const count = size >= 32768 ? 100 : 1000;
++                power_user.experimental_macro_engine = false;
++                measure(`legacy-evaluate-${size}`, count, () => evaluateMacros(text, env, value => value));
++                measure(`legacy-substitute-${size}`, count, () => st.substituteParams(text));
++                power_user.experimental_macro_engine = true;
++                measure(`engine-substitute-${size}`, count, () => st.substituteParams(text));
++            }
++            for (const experimental of [false, true]) {
++                power_user.experimental_macro_engine = experimental;
++                const regex = { findRegex: '/(word)/g', replaceString: '<em>$1</em>', trimStrings: [], substituteRegex: 0 };
++                measure(`regex-1000-matches-engine-${experimental}`, 10, () => runRegexScript(regex, 'word '.repeat(1000)));
++            }
++
++            // Differential checks use deterministic macro values and preserve every hook.
++            st.chat_metadata.main_chat = 'macro-performance-differential';
++            delete st.chat_metadata.chat_id_hash;
++            const inputs = [
++                '', 'plain text', '{', '}', '{single}', 'trailing {', '\\{escaped\\}',
++                '日本語 👩🏽‍💻', '\ud800', 'line\r\nsecond\tline', '<em>ordinary HTML</em>',
++                '<USERLAND>', '<user >', '<USER>', '<BOT> <CHAR> <GROUP> <CHARIFNOTGROUP>',
++                '{{probe}}', '{{unknownPlainTextMacro}}', '{{', '{{probe', '{{{probe}}}',
++                '{{setvar::perfcheck::2}}{{incvar::perfcheck}}{{getvar::perfcheck}}',
++                '{{pick::first::second}}', '{{trim}}\ntext\n{{trim}}', '[insert]', '[empty]',
++                '\\{\\{probe\\}\\}',
++            ];
++            let seed = 42;
++            const alphabet = 'ab{}<>\\ 日本語\n';
++            for (let iteration = 0; iteration < 100; iteration++) {
++                let text = '';
++                for (let index = 0; index < 40; index++) {
++                    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
++                    text += alphabet[seed % alphabet.length];
++                }
++                inputs.push(text);
++            }
++            const compatibility = [];
++            power_user.experimental_macro_engine = false;
++            MacrosParser.registerMacro('probe', () => 'registered value');
++            let posts = 0;
++            for (const input of inputs) {
++                compatibility.push(st.substituteParams(input, {
++                    name1Override: '{{probe}}', name2Override: 'character', groupOverride: 'group',
++                    postProcessFn: value => { posts++; return value; },
++                }));
++            }
++            compatibility.push({ legacyPosts: posts, hashInitialized: typeof st.chat_metadata.chat_id_hash === 'number' });
++            MacrosParser.unregisterMacro('probe');
++            power_user.experimental_macro_engine = true;
++            let providers = 0;
++            let beforeCalls = 0;
++            let afterCalls = 0;
++            let macroCalls = 0;
++            macros.envBuilder.registerProvider(() => { providers++; });
++            const before = text => { beforeCalls++; return text === '[empty]' ? '' : text.replace('[insert]', '{{probe}}'); };
++            const after = text => { afterCalls++; return text + '|post'; };
++            macros.engine.addPreProcessor(before);
++            macros.engine.addPostProcessor(after);
++            try {
++                for (const input of inputs) {
++                    compatibility.push(st.substituteParams(input, {
++                        name1Override: 'user', name2Override: 'character',
++                        dynamicMacros: { probe: () => { macroCalls++; return 'dynamic value'; } },
++                    }));
++                }
++            } finally {
++                macros.engine.removePreProcessor(before);
++                macros.engine.removePostProcessor(after);
++            }
++            compatibility.push({ providers, beforeCalls, afterCalls, macroCalls });
++            return { rows, compatibility };
++        }, { checkOnly });
++        if (results.length > 0) assert.deepEqual(result.compatibility, results[0].compatibility, `${implementation} macro behavior changed`);
++        results.push({ implementation, baseline, ...result });
++        await page.close();
++    }
++    console.log(JSON.stringify(results.map(({ compatibility, ...result }) => ({ ...result, compatibilityChecks: compatibility.length })), null, 2));
++} finally {
++    await browser.close();
++}
+diff --git a/tests/frontend/MacroPlainText.e2e.js b/tests/frontend/MacroPlainText.e2e.js
+new file mode 100644
+index 00000000..4b7c4f9a
+--- /dev/null
++++ b/tests/frontend/MacroPlainText.e2e.js
+@@ -0,0 +1,143 @@
++import { test, expect } from '@playwright/test';
++import { testSetup } from './frontent-test-utils.js';
++
++test.beforeEach(async ({ page }) => {
++    await page.route('**/api/settings/get', async route => {
++        const response = await route.fetch();
++        const data = await response.json();
++        const settings = JSON.parse(data.settings);
++        settings.firstRun = false;
++        data.settings = JSON.stringify(settings);
++        await route.fulfill({ response, json: data });
++    });
++    await page.route('**/api/settings/save', route => route.fulfill({ json: { result: 'ok' } }));
++    await testSetup.awaitST({ page });
++    await page.locator('#chat .mes[type="welcome_prompt"]').waitFor();
++});
++
++test('legacy plain text preserves environment setup without executing absent macros', async ({ page }) => {
++    const result = await page.evaluate(async () => {
++        const { evaluateMacros, MacrosParser } = await import('/scripts/macros.js');
++        const { chat_metadata } = await import('/script.js');
++        const { power_user } = await import('/scripts/power-user.js');
++        power_user.experimental_macro_engine = false;
++        power_user.prefer_character_prompt = true;
++        let reads = 0;
++        let registrations = 0;
++        let executions = 0;
++        let postProcesses = 0;
++        const registered = () => { executions++; return 'must not execute'; };
++        MacrosParser.registerMacro('plaintextProbe', registered);
++        const env = {};
++        Object.defineProperty(env, 'charPrompt', { enumerable: true, get() { reads++; return 'character prompt'; } });
++        Object.defineProperty(env, 'plaintextProbe', { enumerable: true, set(value) { if (value === registered) registrations++; } });
++        delete chat_metadata.chat_id_hash;
++        chat_metadata.main_chat = 'macro-plain-text-regression';
++        const inputs = ['ordinary text', '<em>formatted text</em>', '<USERLAND> literal', '<user > literal', '{single} braces', '\\{escaped\\}', '日本語 👩🏽‍💻'];
++        const outputs = inputs.map(input => evaluateMacros(input, env, value => { postProcesses++; return value; }));
++        MacrosParser.unregisterMacro('plaintextProbe');
++        return { inputs, outputs, reads, registrations, executions, postProcesses, hashInitialized: typeof chat_metadata.chat_id_hash === 'number' };
++    });
++    expect(result.outputs).toEqual(result.inputs);
++    expect(result).toMatchObject({ reads: 14, registrations: 7, executions: 0, postProcesses: 0, hashInitialized: true });
++});
++
++test('legacy markers still introduce macros and preserve replacement side effects and ordering', async ({ page }) => {
++    const result = await page.evaluate(async () => {
++        const { evaluateMacros, MacrosParser } = await import('/scripts/macros.js');
++        const { power_user } = await import('/scripts/power-user.js');
++        power_user.experimental_macro_engine = false;
++        const calls = [];
++        MacrosParser.registerMacro('plaintextDynamic', () => { calls.push('macro'); return 'resolved'; });
++        const env = {
++            user: () => { calls.push('user'); return '{{plaintextDynamic}}'; },
++            char: 'character', group: 'group',
++        };
++        const output = evaluateMacros('<uSeR> <BOT> <CHAR> <GROUP> <CHARIFNOTGROUP>', env, value => {
++            calls.push(`post:${value}`);
++            return value;
++        });
++        MacrosParser.unregisterMacro('plaintextDynamic');
++        return { output, calls };
++    });
++    expect(result).toEqual({
++        output: 'resolved character character group group',
++        calls: ['user', 'post:{{plaintextDynamic}}', 'post:character', 'post:character', 'post:group', 'post:group', 'macro', 'post:resolved'],
++    });
++});
++
++test('new engine runs environment providers and both processor stages for plain text', async ({ page }) => {
++    const result = await page.evaluate(async () => {
++        const { substituteParams } = await import('/script.js');
++        const { macros } = await import('/scripts/macros/macro-system.js');
++        const { power_user } = await import('/scripts/power-user.js');
++        power_user.experimental_macro_engine = true;
++        const calls = [];
++        macros.envBuilder.registerProvider(env => { calls.push('provider'); env.testProbe = 'provider value'; });
++        const before = (text, env) => {
++            calls.push(['before', Object.isFrozen(env), env.testProbe]);
++            return text + '|before';
++        };
++        const after = (text, env) => {
++            calls.push(['after', Object.isFrozen(env), env.testProbe]);
++            return text + '|after {{unused}}';
++        };
++        macros.engine.addPreProcessor(before);
++        macros.engine.addPostProcessor(after);
++        try {
++            const output = substituteParams('ordinary text', { dynamicMacros: { unused: () => { calls.push('unexpected macro'); return 'bad'; } } });
++            return { output, calls };
++        } finally {
++            macros.engine.removePreProcessor(before);
++            macros.engine.removePostProcessor(after);
++        }
++    });
++    expect(result).toEqual({
++        output: 'ordinary text|before|after {{unused}}',
++        calls: ['provider', ['before', true, 'provider value'], ['after', true, 'provider value']],
++    });
++});
++
++test('new engine still parses macros introduced by processors and cleans escaped plain text', async ({ page }) => {
++    const result = await page.evaluate(async () => {
++        const { substituteParams } = await import('/script.js');
++        const { macros } = await import('/scripts/macros/macro-system.js');
++        const { ELSE_MARKER } = await import('/scripts/macros/definitions/core-macros.js');
++        const { power_user } = await import('/scripts/power-user.js');
++        power_user.experimental_macro_engine = true;
++        let executions = 0;
++        const before = text => text === 'inject here' ? '{{probe}}' : text;
++        macros.engine.addPreProcessor(before);
++        try {
++            const injected = substituteParams('inject here', { dynamicMacros: { probe: () => { executions++; return 'injected macro'; } } });
++            const escaped = substituteParams('escaped \\{\\{probe\\}\\}' + ELSE_MARKER);
++            const legacy = substituteParams('<USER>', { name1Override: 'user name' });
++            const unknown = substituteParams('literal {{unknownMacroForPlainTextTest}}');
++            return { injected, escaped, legacy, unknown, executions };
++        } finally {
++            macros.engine.removePreProcessor(before);
++        }
++    });
++    expect(result).toEqual({ injected: 'injected macro', escaped: 'escaped {{probe}}', legacy: 'user name', unknown: 'literal {{unknownMacroForPlainTextTest}}', executions: 1 });
++});
++
++test('an empty preprocessor result retains the existing invalid-parse fallback', async ({ page }) => {
++    const result = await page.evaluate(async () => {
++        const { substituteParams } = await import('/script.js');
++        const { macros } = await import('/scripts/macros/macro-system.js');
++        const { power_user } = await import('/scripts/power-user.js');
++        power_user.experimental_macro_engine = true;
++        let posts = 0;
++        const before = () => '';
++        const after = text => { posts++; return text + 'processed'; };
++        macros.engine.addPreProcessor(before);
++        macros.engine.addPostProcessor(after);
++        try {
++            return { output: substituteParams('original input'), posts };
++        } finally {
++            macros.engine.removePreProcessor(before);
++            macros.engine.removePostProcessor(after);
++        }
++    });
++    expect(result).toEqual({ output: 'original input', posts: 0 });
++});

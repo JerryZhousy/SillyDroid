@@ -1,0 +1,735 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Thu, 22 Oct 2026 18:11:26 +0900
+Subject: [PATCH 05/31] Avoid stale chat searches and duplicate rendering work
+
+---
+ public/script.js                        | 140 ++++++++++++++---
+ public/scripts/templates.js             |  30 +++-
+ public/scripts/util/markdown-cache.js   |   2 +-
+ tests/frontend/ChatSearch.e2e.js        | 197 ++++++++++++++++++++++++
+ tests/frontend/StreamingMarkdown.e2e.js | 143 +++++++++++++++++
+ tests/frontend/TemplateLoading.e2e.js   |  48 ++++++
+ 6 files changed, 530 insertions(+), 30 deletions(-)
+ create mode 100644 tests/frontend/ChatSearch.e2e.js
+ create mode 100644 tests/frontend/StreamingMarkdown.e2e.js
+ create mode 100644 tests/frontend/TemplateLoading.e2e.js
+
+diff --git a/public/script.js b/public/script.js
+index e3c5c7e7..9506f1cb 100644
+--- a/public/script.js
++++ b/public/script.js
+@@ -146,6 +146,7 @@ import {
+ 
+ import {
+     debounce,
++    cancelDebounce,
+     delay,
+     trimToEndSentence,
+     countOccurrences,
+@@ -284,7 +285,7 @@ import { SimpleMutex } from './scripts/util/SimpleMutex.js';
+ import { AudioPlayer } from './scripts/audio-player.js';
+ import { MacroEnvBuilder } from './scripts/macros/engine/MacroEnvBuilder.js';
+ import { MessageFormatter } from './scripts/message-formatter.js';
+-import { trackMarkdownConverter } from './scripts/util/markdown-cache.js';
++import { MarkdownRenderCache, trackMarkdownConverter } from './scripts/util/markdown-cache.js';
+ import { MacroEngine } from './scripts/macros/engine/MacroEngine.js';
+ import { addChatBackupsBrowser } from './scripts/chat-backups.js';
+ import { onboardingExperimentalMacroEngine } from './scripts/macros/engine/MacroDiagnostics.js';
+@@ -3543,6 +3544,7 @@ function hideStopButton() {
+ 
+ class StreamingProcessor {
+     #updateStreamingContent = createStreamingContentUpdater();
++    #markdownCache = new MarkdownRenderCache();
+ 
+     /**
+      * Creates a new streaming processor.
+@@ -3718,6 +3720,10 @@ class StreamingProcessor {
+                 };
+             }
+ 
++            // Reasoning/tool updates can leave the visible answer unchanged.
++            // Reuse only Markdown conversion; regexes, hooks and sanitization
++            // still run, and the final render always gets a fresh conversion.
++            if (isFinal) this.#markdownCache.clear();
+             const formattedText = messageFormatting(
+                 processedText,
+                 chat[messageId].name,
+@@ -3726,6 +3732,7 @@ class StreamingProcessor {
+                 messageId,
+                 {},
+                 false,
++                this.#markdownCache,
+             );
+             if (this.messageTextDom instanceof HTMLElement) {
+                 this.#updateStreamingContent(this.messageTextDom, formattedText, power_user.stream_fade_in, isFinal);
+@@ -8543,6 +8550,43 @@ export function getCurrentChatDetails() {
+     return { sessionName: currentChat, group: group, characterName: displayName, avatarImgURL: avatarImg };
+ }
+ 
++/**
++ * @typedef {object} PastChatsView
++ * @property {string|null} groupId Selected group when the view was opened
++ * @property {string|null} characterAvatar Selected character when the view was opened
++ * @property {string} currentChat Current chat filename
++ * @property {string} avatarImg Avatar image URL
++ * @property {AbortController|null} controller Pending search request
++ * @property {Function|null} debouncedDisplay Pending search callback
++ * @property {ReturnType<typeof setTimeout>|null} focusTimeout Pending autofocus timer
++ * @property {boolean} hasInput Whether the user has edited the search field
++ */
++
++/** @type {PastChatsView|null} */
++let pastChatsView = null;
++
++/** Cancels requests and callbacks belonging to the previous chat browser view. */
++function cancelPastChatsSearch() {
++    pastChatsView?.controller?.abort();
++    if (pastChatsView?.debouncedDisplay) {
++        cancelDebounce(pastChatsView.debouncedDisplay);
++    }
++    clearTimeout(pastChatsView?.focusTimeout);
++    pastChatsView = null;
++    $('#select_chat_search').off('input');
++}
++
++/**
++ * Checks both the view identity and its character/group context before applying results.
++ * @param {PastChatsView} view Chat browser view
++ * @returns {boolean} Whether the view still belongs to the current context
++ */
++function isCurrentPastChatsView(view) {
++    return pastChatsView === view
++        && view.groupId === selected_group
++        && (view.groupId !== null || view.characterAvatar === (characters[this_chid]?.avatar ?? null));
++}
++
+ /**
+  * Displays the past chats for a character or a group based on the selected context.
+  * The function first fetches the chats, processes them, and then displays them in
+@@ -8551,28 +8595,48 @@ export function getCurrentChatDetails() {
+  * @param {string[]} hightlightNames - An array of chat names to highlight
+  */
+ export async function displayPastChats(hightlightNames = []) {
++    cancelPastChatsSearch();
+     $('#select_chat_div').empty();
+-    $('#select_chat_search').val('').off('input');
++    $('#select_chat_search').val('');
+ 
+     const chatDetails = getCurrentChatDetails();
+-    const currentChat = chatDetails.sessionName;
+-    const displayName = chatDetails.characterName;
+-    const avatarImg = chatDetails.avatarImgURL;
+-
+-    await displayChats('', currentChat, displayName, avatarImg, selected_group, hightlightNames);
++    /** @type {PastChatsView} */
++    const view = {
++        groupId: selected_group,
++        characterAvatar: selected_group ? null : characters[this_chid]?.avatar ?? null,
++        currentChat: chatDetails.sessionName,
++        avatarImg: chatDetails.avatarImgURL,
++        controller: null,
++        debouncedDisplay: null,
++        focusTimeout: null,
++        hasInput: false,
++    };
++    pastChatsView = view;
+ 
+-    const debouncedDisplay = debounce((searchQuery) => {
+-        displayChats(searchQuery, currentChat, displayName, avatarImg, selected_group, []);
++    view.debouncedDisplay = debounce((searchQuery) => {
++        displayChats(searchQuery, view, []);
+     });
+ 
+-    // Define the search input listener
+-    $('#select_chat_search').off('input').on('input', function () {
++    // Invalidate the old response immediately, including during the debounce delay.
++    // Bind before fetching so typing also works while the initial list is loading.
++    $('#select_chat_search').on('input', function () {
++        view.hasInput = true;
++        clearTimeout(view.focusTimeout);
++        view.controller?.abort();
+         const searchQuery = $(this).val();
+-        debouncedDisplay(searchQuery);
++        view.debouncedDisplay(searchQuery);
+     });
+ 
++    await displayChats('', view, hightlightNames);
++    if (!isCurrentPastChatsView(view)) {
++        return;
++    }
++
+     // UX convenience: Focus the search field when the Manage Chat Files view opens.
+-    setTimeout(function () {
++    view.focusTimeout = setTimeout(function () {
++        if (!isCurrentPastChatsView(view) || view.hasInput) {
++            return;
++        }
+         const textSearchElement = $('#select_chat_search');
+         textSearchElement.trigger('click').trigger('focus').trigger('select');
+     }, 200);
+@@ -8580,15 +8644,28 @@ export async function displayPastChats(hightlightNames = []) {
+     addChatBackupsBrowser();
+ }
+ 
+-async function displayChats(searchQuery, currentChat, displayName, avatarImg, selected_group, highlightNames) {
++/**
++ * Loads the latest search results for one chat browser view.
++ * @param {string} searchQuery Search query
++ * @param {PastChatsView} view Chat browser view
++ * @param {string[]} highlightNames Chat filenames to highlight
++ */
++async function displayChats(searchQuery, view, highlightNames) {
++    if (!isCurrentPastChatsView(view)) {
++        return;
++    }
++    view.controller?.abort();
++    const controller = new AbortController();
++    view.controller = controller;
+     try {
+         const response = await fetch('/api/chats/search', {
+             method: 'POST',
+             headers: getRequestHeaders(),
++            signal: controller.signal,
+             body: JSON.stringify({
+                 query: searchQuery,
+-                avatar_url: selected_group ? null : characters[this_chid].avatar,
+-                group_id: selected_group || null,
++                avatar_url: view.characterAvatar,
++                group_id: view.groupId,
+             }),
+         });
+ 
+@@ -8597,15 +8674,19 @@ async function displayChats(searchQuery, currentChat, displayName, avatarImg, se
+         }
+ 
+         const filteredData = await response.json();
+-        $('#select_chat_div').empty();
++        if (controller.signal.aborted || !isCurrentPastChatsView(view)) {
++            return;
++        }
+ 
+         filteredData.sort((a, b) => sortMoments(timestampToMoment(a.last_mes), timestampToMoment(b.last_mes)));
++        const fragment = document.createDocumentFragment();
++        const highlightedTemplates = [];
+ 
+         for (const chat of filteredData) {
+-            const isSelected = currentChat === chat.file_name;
++            const isSelected = view.currentChat === chat.file_name;
+             const template = $('#past_chat_template .select_chat_block_wrapper').clone();
+             template.find('.select_chat_block').attr('file_name', chat.file_name);
+-            template.find('.avatar img').attr('src', avatarImg);
++            template.find('.avatar img').attr('src', view.avatarImg);
+             template.find('.select_chat_block_filename').text(chat.file_name);
+             template.find('.chat_file_size').text(`(${chat.file_size},`);
+             template.find('.chat_messages_num').text(`${chat.message_count} 💬)`);
+@@ -8617,17 +8698,29 @@ async function displayChats(searchQuery, currentChat, displayName, avatarImg, se
+                 template.find('.select_chat_block').attr('highlight', String(true));
+             }
+ 
+-            $('#select_chat_div').append(template);
++            fragment.appendChild(template[0]);
+ 
+             if (Array.isArray(highlightNames) && highlightNames.includes(chat.file_name)) {
+-                const templateOffset = template.offset().top - template.parent().offset().top;
+-                $('#select_chat_div').scrollTop(templateOffset);
+-                flashHighlight(template, debounce_timeout.extended);
++                highlightedTemplates.push(template);
+             }
+         }
++        const chatList = $('#select_chat_div');
++        chatList.empty().append(fragment);
++        for (const template of highlightedTemplates) {
++            const templateOffset = template.offset().top - template.parent().offset().top;
++            chatList.scrollTop(templateOffset);
++            flashHighlight(template, debounce_timeout.extended);
++        }
+     } catch (error) {
++        if (controller.signal.aborted || !isCurrentPastChatsView(view)) {
++            return;
++        }
+         console.error('Error loading chats:', error);
+         toastr.error('Could not load chat data. Try reloading the page.');
++    } finally {
++        if (view.controller === controller) {
++            view.controller = null;
++        }
+     }
+ }
+ 
+@@ -11805,6 +11898,7 @@ jQuery(async function () {
+     //////////////////////////////////////////////////////////////
+ 
+     $('#select_chat_cross').on('click', function () {
++        cancelPastChatsSearch();
+         $('#shadow_select_chat_popup').transition({
+             opacity: 0,
+             duration: animation_duration,
+diff --git a/public/scripts/templates.js b/public/scripts/templates.js
+index 69a8eaba..36f1d1cd 100644
+--- a/public/scripts/templates.js
++++ b/public/scripts/templates.js
+@@ -6,6 +6,8 @@ import { applyLocale } from './i18n.js';
+  * @description Cache for Handlebars templates.
+  */
+ const TEMPLATE_CACHE = new Map();
++/** @type {Map<string, Promise<function>>} Template loads shared by concurrent renderers. */
++const TEMPLATE_REQUESTS = new Map();
+ 
+ /**
+  * Loads a URL content using XMLHttpRequest synchronously.
+@@ -59,13 +61,29 @@ function getUrlAsync(url) {
+  */
+ export async function renderTemplateAsync(templateId, templateData = {}, sanitize = true, localize = true, fullPath = false) {
+     async function fetchTemplateAsync(pathToTemplate) {
+-        let template = TEMPLATE_CACHE.get(pathToTemplate);
+-        if (!template) {
+-            const templateContent = await getUrlAsync(pathToTemplate);
+-            template = Handlebars.compile(templateContent);
+-            TEMPLATE_CACHE.set(pathToTemplate, template);
++        const cached = TEMPLATE_CACHE.get(pathToTemplate);
++        if (cached) return cached;
++
++        let pending = TEMPLATE_REQUESTS.get(pathToTemplate);
++        if (!pending) {
++            pending = (async () => {
++                const templateContent = await getUrlAsync(pathToTemplate);
++                // A synchronous caller may have populated the cache while the
++                // request was pending. Keep the same compiled template in that case.
++                const template = TEMPLATE_CACHE.get(pathToTemplate) || Handlebars.compile(templateContent);
++                TEMPLATE_CACHE.set(pathToTemplate, template);
++                return template;
++            })();
++            TEMPLATE_REQUESTS.set(pathToTemplate, pending);
++        }
++        try {
++            return await pending;
++        } finally {
++            // Failures must remain retryable; cache only compiled templates.
++            if (TEMPLATE_REQUESTS.get(pathToTemplate) === pending) {
++                TEMPLATE_REQUESTS.delete(pathToTemplate);
++            }
+         }
+-        return template;
+     }
+ 
+     try {
+diff --git a/public/scripts/util/markdown-cache.js b/public/scripts/util/markdown-cache.js
+index 0908bc6d..8c3683de 100644
+--- a/public/scripts/util/markdown-cache.js
++++ b/public/scripts/util/markdown-cache.js
+@@ -46,7 +46,7 @@ function isNativeConverter(converter) {
+ }
+ 
+ /**
+- * One-result cache owned by a reasoning handler. Regexes, formatter hooks and
++ * One-result cache owned by a streaming processor or reasoning handler. Regexes, formatter hooks and
+  * sanitization stay outside this cache and continue to run on every update.
+  */
+ export class MarkdownRenderCache {
+diff --git a/tests/frontend/ChatSearch.e2e.js b/tests/frontend/ChatSearch.e2e.js
+new file mode 100644
+index 00000000..38adc913
+--- /dev/null
++++ b/tests/frontend/ChatSearch.e2e.js
+@@ -0,0 +1,197 @@
++import { expect, test } from '@playwright/test';
++import { testSetup } from './frontent-test-utils.js';
++
++// Search responses are controlled in-browser; no model requests are made.
++test.beforeEach(async ({ page }) => {
++    const baseURL = process.env.ST_BASE_URL || process.env.PLAYWRIGHT_BASE_URL || 'http://127.0.0.1:8000';
++    await page.route('**/*', route => new URL(route.request().url()).origin === new URL(baseURL).origin
++        ? route.continue() : route.abort());
++    await testSetup.awaitST({ page });
++    await page.evaluate(async () => {
++        const st = await import('/script.js');
++        const { resetSelectedGroup } = await import('/scripts/group-chats.js');
++        const { debounce_timeout } = await import('/scripts/constants.js');
++        resetSelectedGroup();
++        const firstId = st.characters.length;
++        st.characters.push(
++            { name: 'Search A', avatar: 'search-a.png', chat: 'Selected chat A' },
++            { name: 'Search B', avatar: 'search-b.png', chat: 'Selected chat B' },
++        );
++        st.setCharacterId(firstId);
++        const requests = [];
++        const fetch = window.fetch;
++        window.fetch = (url, options) => {
++            if (url !== '/api/chats/search') return fetch(url, options);
++            // Deliberately ignore aborts: stale results must also be rejected after JSON decoding.
++            return new Promise((resolve, reject) => requests.push({
++                body: JSON.parse(options.body), signal: options.signal,
++                resolve: data => resolve({ ok: true, json: async () => data }),
++                reject,
++            }));
++        };
++        const waitFor = async predicate => {
++            for (let i = 0; i < 200; i++) {
++                if (predicate()) return;
++                await new Promise(resolve => setTimeout(resolve, 10));
++            }
++            throw new Error('Timed out waiting for search state');
++        };
++        const input = value => {
++            const element = document.getElementById('select_chat_search');
++            element.value = value;
++            element.dispatchEvent(new Event('input', { bubbles: true }));
++        };
++        const row = (file_name, last_mes = '2026-01-01') => ({
++            file_name, last_mes, file_size: '1 KB', message_count: 2, preview_message: `<b>${file_name}</b>`,
++        });
++        window.searchFixture = { st, requests, waitFor, input, row, firstId, debounce_timeout };
++    });
++});
++
++test('chat search accepts input during initial loading and never paints an obsolete response', async ({ page }) => {
++    const result = await page.evaluate(async () => {
++        const { st, requests, waitFor, input, row } = window.searchFixture;
++        const initialLoad = st.displayPastChats();
++        input('older query');
++        const initialAborted = requests[0].signal.aborted;
++        await waitFor(() => requests.length === 2);
++        input('latest query');
++        const olderAborted = requests[1].signal.aborted;
++        await waitFor(() => requests.length === 3);
++        requests[2].resolve([row('Latest result')]);
++        await waitFor(() => document.querySelector('#select_chat_div .select_chat_block_filename')?.textContent === 'Latest result');
++        requests[1].resolve([row('Obsolete result')]);
++        requests[0].resolve([row('Obsolete initial list')]);
++        await initialLoad;
++        await new Promise(resolve => setTimeout(resolve, 0));
++        return {
++            initialAborted, olderAborted,
++            queries: requests.map(request => request.body.query),
++            filenames: [...document.querySelectorAll('#select_chat_div .select_chat_block_filename')].map(element => element.textContent),
++            errors: document.querySelectorAll('.toast-error').length,
++        };
++    });
++    expect(result.initialAborted).toBe(true);
++    expect(result.olderAborted).toBe(true);
++    expect(result.queries).toEqual(['', 'older query', 'latest query']);
++    expect(result.filenames).toEqual(['Latest result']);
++    expect(result.errors).toBe(0);
++});
++
++test('reopening for another character isolates requests, callbacks and error notifications', async ({ page }) => {
++    const result = await page.evaluate(async () => {
++        const { st, requests, waitFor, input, row, firstId } = window.searchFixture;
++        const firstLoad = st.displayPastChats();
++        input('abandoned debounce');
++        st.setCharacterId(firstId + 1);
++        const secondLoad = st.displayPastChats();
++        requests[1].resolve([row('Selected chat B')]);
++        await secondLoad;
++        requests[0].reject(new Error('Obsolete request failed'));
++        await firstLoad;
++        input('character B query');
++        await waitFor(() => requests.length >= 3);
++        requests[2].resolve([row('Selected chat B')]);
++        await waitFor(() => document.querySelector('#select_chat_div .select_chat_block_filename')?.textContent === 'Selected chat B');
++        return {
++            requests: requests.map(request => request.body),
++            selected: document.querySelector('#select_chat_div .select_chat_block')?.getAttribute('highlight'),
++            errors: document.querySelectorAll('.toast-error').length,
++        };
++    });
++    expect(result.requests).toEqual([
++        { query: '', avatar_url: 'search-a.png', group_id: null },
++        { query: '', avatar_url: 'search-b.png', group_id: null },
++        { query: 'character B query', avatar_url: 'search-b.png', group_id: null },
++    ]);
++    expect(result.selected).toBe('true');
++    expect(result.errors).toBe(0);
++});
++
++test('changing characters without reopening discards the old results and the current request still reports failures', async ({ page }) => {
++    const result = await page.evaluate(async () => {
++        const { st, requests, row, firstId } = window.searchFixture;
++        const firstLoad = st.displayPastChats();
++        st.setCharacterId(firstId + 1);
++        requests[0].resolve([row('Wrong character')]);
++        await firstLoad;
++        const rendered = document.querySelectorAll('#select_chat_div .select_chat_block').length;
++        const secondLoad = st.displayPastChats();
++        requests[1].reject(new Error('Current request failed'));
++        await secondLoad;
++        return { rendered, errors: document.querySelectorAll('.toast-error').length };
++    });
++    expect(result.rendered).toBe(0);
++    expect(result.errors).toBe(1);
++});
++
++test('closing the chat browser cancels requests and pending debounce work', async ({ page }) => {
++    const result = await page.evaluate(async () => {
++        const { st, requests, input, row, debounce_timeout } = window.searchFixture;
++        const initialLoad = st.displayPastChats();
++        input('never send');
++        document.getElementById('select_chat_cross').click();
++        requests[0].resolve([row('Must not render after closing')]);
++        await initialLoad;
++        await new Promise(resolve => setTimeout(resolve, debounce_timeout.standard + 100));
++        return {
++            count: requests.length,
++            aborted: requests[0].signal.aborted,
++            rendered: document.querySelectorAll('#select_chat_div .select_chat_block').length,
++            errors: document.querySelectorAll('.toast-error').length,
++        };
++    });
++    expect(result.count).toBe(1);
++    expect(result.aborted).toBe(true);
++    expect(result.rendered).toBe(0);
++    expect(result.errors).toBe(0);
++});
++
++test('typing during initial loading is not interrupted by delayed autofocus and selection', async ({ page }) => {
++    const result = await page.evaluate(async () => {
++        const { st, requests, input } = window.searchFixture;
++        let selections = 0;
++        $('#select_chat_search').on('select.autofocus-test', () => selections++);
++        const initialLoad = st.displayPastChats();
++        input('Keep typing this query');
++        requests[0].resolve([]);
++        await initialLoad;
++        await new Promise(resolve => setTimeout(resolve, 350));
++        $('#select_chat_search').off('select.autofocus-test');
++        return { selections, query: document.getElementById('select_chat_search').value };
++    });
++    expect(result.selections).toBe(0);
++    expect(result.query).toBe('Keep typing this query');
++});
++
++test('large chat lists are inserted in one batch while preserving dates, selection and escaped previews', async ({ page }) => {
++    const result = await page.evaluate(async () => {
++        const { st, requests, row } = window.searchFixture;
++        const initialLoad = st.displayPastChats();
++        const list = document.getElementById('select_chat_div');
++        const records = [];
++        const observer = new MutationObserver(mutations => records.push(...mutations));
++        observer.observe(list, { childList: true });
++        const rows = Array.from({ length: 200 }, (_, index) => row(`Chat ${index}`, 1700000000000 + index * 1000));
++        rows.push(row('Selected chat A', '2026-01-01'));
++        requests[0].resolve(rows);
++        await initialLoad;
++        observer.disconnect();
++        return {
++            addedBatches: records.filter(record => record.addedNodes.length > 0).length,
++            addedRows: records.reduce((count, record) => count + record.addedNodes.length, 0),
++            first: list.querySelector('.select_chat_block_filename')?.textContent,
++            last: list.querySelector('.select_chat_block_wrapper:last-child .select_chat_block_filename')?.textContent,
++            selected: list.querySelector('.select_chat_block[highlight="true"]')?.getAttribute('file_name'),
++            preview: list.querySelector('.select_chat_block_mes')?.textContent,
++            markup: list.querySelector('.select_chat_block_mes b') !== null,
++        };
++    });
++    expect(result.addedBatches).toBe(1);
++    expect(result.addedRows).toBe(201);
++    expect(result.first).toBe('Selected chat A');
++    expect(result.last).toBe('Chat 0');
++    expect(result.selected).toBe('Selected chat A');
++    expect(result.preview).toBe('<b>Selected chat A</b>');
++    expect(result.markup).toBe(false);
++});
+diff --git a/tests/frontend/StreamingMarkdown.e2e.js b/tests/frontend/StreamingMarkdown.e2e.js
+new file mode 100644
+index 00000000..6145d363
+--- /dev/null
++++ b/tests/frontend/StreamingMarkdown.e2e.js
+@@ -0,0 +1,143 @@
++import { test, expect } from '@playwright/test';
++import { testSetup } from './frontent-test-utils.js';
++
++test('streaming body caches unchanged Markdown while regexes, hooks, sanitization and final rendering stay live', async ({ page }) => {
++    test.setTimeout(60000);
++    await page.route('**/api/settings/save', route => route.fulfill({ json: { result: 'ok' } }));
++    await page.route('**/api/chats/save', route => route.fulfill({ json: { result: 'ok' } }));
++    await page.route('**/api/backends/chat-completions/status', route => route.fulfill({ json: { data: [] } }));
++    await page.route('**/api/tokenizers/**', route => route.fulfill({ json: { count: 8, token_count: 8, ids: [1, 2, 3] } }));
++    await testSetup.awaitST({ page });
++
++    const result = await page.evaluate(async () => {
++        const st = await import('/script.js');
++        const { oai_settings } = await import('/scripts/openai.js');
++        const { power_user } = await import('/scripts/power-user.js');
++        const { extension_settings } = await import('/scripts/extensions.js');
++        const { MessageFormatter } = await import('/scripts/message-formatter.js');
++        const { showdown } = await import('/lib.js');
++
++        await st.newAssistantChat({ temporary: true });
++        st.changeMainAPI('openai');
++        Object.assign(oai_settings, {
++            chat_completion_source: 'custom', custom_url: 'https://example.invalid',
++            custom_model: 'streaming-test', stream_openai: true,
++        });
++        Object.assign(power_user, {
++            markdown_escape_strings: '', stream_fade_in: false,
++            message_token_count_enabled: false, encode_tags: false,
++        });
++        st.setOnlineStatus('streaming-test');
++        const userMessage = { name: 'User', is_user: true, is_system: false, mes: 'Begin a streamed answer.', extra: {} };
++        st.chat.push(userMessage);
++        await st.addOneMessage(userMessage);
++
++        // Hold a real Generate request open after its first SSE delta, so the
++        // application creates its own processor and message DOM naturally.
++        const originalFetch = window.fetch;
++        let streamController;
++        window.fetch = (url, options) => {
++            if (url !== '/api/backends/chat-completions/generate') return originalFetch(url, options);
++            const stream = new ReadableStream({
++                start(controller) {
++                    streamController = controller;
++                    controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"Paused answer"}}]}\n\n'));
++                },
++            });
++            return Promise.resolve(new Response(stream, { headers: { 'Content-Type': 'text/event-stream' } }));
++        };
++        let generationError;
++        const generation = st.Generate('normal', { automatic_trigger: true }).catch(error => { generationError = String(error); });
++        for (let attempt = 0; attempt < 500; attempt++) {
++            if (st.streamingProcessor?.messageId >= 0 && st.streamingProcessor?.result === 'Paused answer') break;
++            if (generationError) throw new Error(generationError);
++            await new Promise(resolve => setTimeout(resolve, 20));
++        }
++        const processor = st.streamingProcessor;
++        if (!processor?.messageTextDom || !streamController) {
++            throw new Error(`No live streaming processor: ${generationError ?? 'generation did not reach the mocked SSE stream'}`);
++        }
++        // Let the first stream tick finish before driving subsequent updates.
++        await new Promise(resolve => setTimeout(resolve, 100));
++
++        const conversions = [];
++        const NativeConverter = showdown.Converter;
++        // Instrument construction before native tracking, preserving the cache's
++        // normal check that the tracked makeHtml function has not been replaced.
++        showdown.Converter = function (...args) {
++            const converter = new NativeConverter(...args);
++            const makeHtml = converter.makeHtml;
++            converter.makeHtml = function (text) {
++                conversions.push(text);
++                return makeHtml.call(this, text);
++            };
++            return converter;
++        };
++        const converter = st.reloadMarkdownProcessor();
++        showdown.Converter = NativeConverter;
++        const originalRegex = extension_settings.regex;
++        extension_settings.regex = [];
++        const body = '**STREAM_CACHE_MARKER** original';
++        const bodyConversions = () => conversions.filter(text => text.includes('STREAM_CACHE_MARKER')).length;
++        let hookRuns = 0;
++        let hookEnabled = true;
++        MessageFormatter.addHook((html, context) => {
++            if (!hookEnabled || context.isReasoning || !html.includes('STREAM_CACHE_MARKER')) return html;
++            hookRuns++;
++            return html + `<span data-stream-hook="${hookRuns}">hook ${hookRuns}</span><img src="x" onerror="window.streamingUnsafe = true">`;
++        }, { stage: MessageFormatter.stage.AFTER_MARKDOWN });
++
++        try {
++            await processor.onProgressStreaming(processor.messageId, body, false);
++            const first = bodyConversions();
++            for (let index = 0; index < 5; index++) {
++                processor.reasoningHandler.updateReasoning(processor.messageId, `Reasoning changed ${index}`);
++                await processor.onProgressStreaming(processor.messageId, body, false);
++            }
++            const repeated = bodyConversions();
++            const repeatedHookRuns = hookRuns;
++            const hookText = processor.messageTextDom.querySelector('[data-stream-hook]')?.textContent;
++            const sanitized = !processor.messageTextDom.querySelector('[onerror]');
++
++            extension_settings.regex = [{
++                id: 'streaming-regex', scriptName: 'Streaming test', findRegex: '/original/g',
++                replaceString: 'replacement', trimStrings: [], placement: [2],
++                disabled: false, markdownOnly: true, promptOnly: false,
++                runOnEdit: true, substituteRegex: 0, minDepth: null, maxDepth: null,
++            }];
++            await processor.onProgressStreaming(processor.messageId, body, false);
++            const afterRegex = bodyConversions();
++            const regexText = processor.messageTextDom.textContent;
++            await processor.onProgressStreaming(processor.messageId, body, false);
++            const repeatedRegex = bodyConversions();
++            await processor.onProgressStreaming(processor.messageId, body, true);
++            const final = bodyConversions();
++            const bold = processor.messageTextDom.querySelector('strong')?.textContent;
++
++            converter.listen('makehtml.before', (event, text) => text);
++            await processor.onProgressStreaming(processor.messageId, body, false);
++            await processor.onProgressStreaming(processor.messageId, body, false);
++            const customListener = bodyConversions();
++            return { first, repeated, repeatedHookRuns, hookText, sanitized, afterRegex, regexText, repeatedRegex, final, bold, customListener };
++        } finally {
++            hookEnabled = false;
++            extension_settings.regex = originalRegex;
++            window.fetch = originalFetch;
++            processor.onStopStreaming();
++            streamController.close();
++            await generation;
++        }
++    });
++
++    expect(result.first).toBe(1);
++    expect(result.repeated).toBe(1);
++    expect(result.repeatedHookRuns).toBe(6);
++    expect(result.hookText).toBe('hook 6');
++    expect(result.sanitized).toBe(true);
++    expect(result.afterRegex).toBe(2);
++    expect(result.regexText).toContain('replacement');
++    expect(result.repeatedRegex).toBe(2);
++    expect(result.final).toBe(3);
++    expect(result.bold).toBe('STREAM_CACHE_MARKER');
++    expect(result.customListener).toBe(5);
++});
+diff --git a/tests/frontend/TemplateLoading.e2e.js b/tests/frontend/TemplateLoading.e2e.js
+new file mode 100644
+index 00000000..d8cfa001
+--- /dev/null
++++ b/tests/frontend/TemplateLoading.e2e.js
+@@ -0,0 +1,48 @@
++import { test, expect } from '@playwright/test';
++import { testSetup } from './frontent-test-utils.js';
++
++test.beforeEach(testSetup.awaitST);
++
++test('concurrent renders share one template request but keep their own data and sanitization', async ({ page }) => {
++    let requests = 0;
++    await page.route('**/__test_shared_template.html', async route => {
++        requests++;
++        await new Promise(resolve => setTimeout(resolve, 50));
++        await route.fulfill({ contentType: 'text/html', body: '<p>{{name}}</p>{{{content}}}' });
++    });
++    const results = await page.evaluate(async () => {
++        const { renderTemplateAsync } = await import('/scripts/templates.js');
++        return Promise.all(Array.from({ length: 24 }, (_, index) => renderTemplateAsync(
++            '/__test_shared_template.html',
++            { name: `Person <${index}>`, content: '<img src="x" onerror="alert(1)">' },
++            true, false, true,
++        )));
++    });
++    expect(requests).toBe(1);
++    expect(results).toHaveLength(24);
++    for (let index = 0; index < results.length; index++) {
++        expect(results[index]).toContain(`Person &lt;${index}&gt;`);
++        expect(results[index]).not.toContain('onerror');
++    }
++});
++
++test('a failed template request can be retried', async ({ page }) => {
++    let requests = 0;
++    await page.route('**/__test_retry_template.html', route => {
++        requests++;
++        return route.fulfill(requests === 1
++            ? { status: 503, body: 'Temporary error' }
++            : { contentType: 'text/html', body: '<p>{{name}}</p>' });
++    });
++    const result = await page.evaluate(async () => {
++        const { renderTemplateAsync } = await import('/scripts/templates.js');
++        const first = await renderTemplateAsync('/__test_retry_template.html', { name: 'First' }, true, false, true);
++        const retry = await renderTemplateAsync('/__test_retry_template.html', { name: 'Retry' }, true, false, true);
++        const cached = await renderTemplateAsync('/__test_retry_template.html', { name: 'Cached' }, true, false, true);
++        return { first, retry, cached };
++    });
++    expect(result.first).toBeUndefined();
++    expect(result.retry).toBe('<p>Retry</p>');
++    expect(result.cached).toBe('<p>Cached</p>');
++    expect(requests).toBe(2);
++});

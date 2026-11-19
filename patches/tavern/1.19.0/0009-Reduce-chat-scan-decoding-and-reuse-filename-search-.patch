@@ -1,0 +1,623 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Thu, 22 Oct 2026 19:46:48 +0900
+Subject: [PATCH 09/31] Reduce chat scan decoding and reuse filename search
+ summaries
+
+---
+ src/endpoints/chats.js        | 220 +++++++++++++++++++---------------
+ tests/bench-chat-scans.mjs    | 165 +++++++++++++++++++++++++
+ tests/chat-byte-scan.node.mjs | 115 ++++++++++++++++++
+ tests/chat-search.node.mjs    |  45 +++++++
+ 4 files changed, 450 insertions(+), 95 deletions(-)
+ create mode 100644 tests/bench-chat-scans.mjs
+ create mode 100644 tests/chat-byte-scan.node.mjs
+
+diff --git a/src/endpoints/chats.js b/src/endpoints/chats.js
+index abb90452..9ce679e8 100644
+--- a/src/endpoints/chats.js
++++ b/src/endpoints/chats.js
+@@ -456,114 +456,140 @@ export async function getChatInfo(pathToFile, additionalData = {}, withMetadata
+  * @param {ChatMatchFunction|ChatTextMatcher|null} matcher Optional message matcher
+  * @returns {Promise<ChatInfo|null>} Summary fields, or null if the file disappeared
+  */
+-function readChatInfo(pathToFile, stats, withMetadata, matcher) {
++async function readChatInfo(pathToFile, stats, withMetadata, matcher) {
+     const incrementalMatcher = typeof matcher === 'object' && typeof matcher?.test === 'function' ? matcher : null;
+     const hasMatcher = typeof matcher === 'function' || !!incrementalMatcher;
+     /** @type {ChatInfo} */
+     const chatData = {};
+ 
+-    return new Promise((res, rej) => {
+-        const fileStream = fs.createReadStream(pathToFile);
+-        let finished = false;
+-        /**
+-         * @param {ChatInfo|null} value Scan result
+-         * @param {Error|null} error Read error
+-         */
+-        const finish = (value, error = null) => {
+-            if (finished) return;
+-            finished = true;
+-            // Keep the read slot until the descriptor is actually closed.
+-            // readline's close event can precede the stream's asynchronous close.
+-            const settle = () => error ? rej(error) : res(value);
+-            if (fileStream.closed) settle();
+-            else {
+-                fileStream.once('close', settle);
+-                fileStream.destroy();
+-            }
+-            rl.close();
+-        };
++    const fileStream = fs.createReadStream(pathToFile);
++    const closed = new Promise(resolve => fileStream.once('close', resolve));
++    /** @type {Buffer[]} */
++    let lineParts = [];
++    let lineBytes = 0;
++    /** @type {Buffer[]|null} */
++    let lastLineParts = null;
++    /** @type {Buffer} */
++    let lastLineBuffer;
++    let lastLineStart = 0;
++    let lastLineEnd = 0;
++    let lastLineBytes = 0;
++    let itemCounter = 0;
++    let hasAnyMatch = false;
++    let matchBuffer = [];
++    let skipLineFeed = false;
+ 
+-        // The file can still disappear between the stat above and the stream opening
+-        fileStream.on('error', (/** @type {NodeJS.ErrnoException} */ error) => {
+-            if (error.code === 'ENOENT') {
+-                chatInfoCache.delete(pathToFile);
+-                finish(null);
+-                return;
+-            }
+-            finish(null, error);
+-        });
++    /**
++     * Decode only lines needed for metadata, a pending search or the final
++     * preview. Concatenating buffers once also handles UTF-8 split across reads
++     * without repeatedly copying an exceptionally long JSONL message.
++     * @param {Buffer[]} parts Segments of one line
++     * @param {number} length Total byte length
++     * @returns {string} Decoded line
++     */
++    const decodeLine = (parts, length) => parts.length === 1
++        ? parts[0].toString('utf8')
++        : Buffer.concat(parts, length).toString('utf8');
+ 
+-        const rl = readline.createInterface({
+-            input: fileStream,
+-            crlfDelay: Infinity,
+-        });
++    const decodeLastLine = () => lastLineParts
++        ? decodeLine(lastLineParts, lastLineBytes)
++        : lastLineBuffer.toString('utf8', lastLineStart, lastLineEnd);
+ 
+-        // readline re-emits input stream errors; without a listener the emit throws
+-        rl.on('error', (error) => {
+-            if (error.code === 'ENOENT') {
+-                finish(null);
+-                return;
++    /**
++     * Keep complete lines as offsets into the read buffer. Most messages fit
++     * within one chunk, so they need neither a Buffer view nor an array per line.
++     * @param {Buffer} chunk Current read buffer
++     * @param {number} start Beginning of the final segment
++     * @param {number} end End of the final segment
++     */
++    const finishLine = (chunk, start, end) => {
++        lastLineBytes = lineBytes + end - start;
++        lastLineBuffer = chunk;
++        lastLineStart = start;
++        lastLineEnd = end;
++        if (lineParts.length) {
++            if (end > start) lineParts.push(chunk.subarray(start, end));
++            lastLineParts = lineParts;
++            lineParts = [];
++        } else {
++            lastLineParts = null;
++        }
++        lineBytes = 0;
++        const needsMetadata = withMetadata && itemCounter === 0;
++        const needsMatch = hasMatcher && !hasAnyMatch && itemCounter > 0;
++        if (needsMetadata || needsMatch) {
++            const jsonData = tryParse(decodeLastLine());
++            if (needsMetadata && jsonData && _.isObjectLike(jsonData.chat_metadata)) {
++                chatData.chat_metadata = jsonData.chat_metadata;
+             }
+-            finish(null, error);
+-        });
+-
+-        let lastLine;
+-        let itemCounter = 0;
+-        let hasAnyMatch = false;
+-        let matchBuffer = [];
+-        rl.on('line', (line) => {
+-            if (withMetadata && itemCounter === 0) {
+-                const jsonData = tryParse(line);
+-                if (jsonData && _.isObjectLike(jsonData.chat_metadata)) {
+-                    chatData.chat_metadata = jsonData.chat_metadata;
++            if (needsMatch && jsonData) {
++                if (incrementalMatcher) {
++                    hasAnyMatch = incrementalMatcher.test(jsonData.mes || '');
++                } else if (typeof matcher === 'function') {
++                    matchBuffer.push(jsonData.mes || '');
++                    hasAnyMatch = matcher(matchBuffer);
+                 }
++                if (hasAnyMatch) matchBuffer = [];
+             }
+-            // Skip matching if any match was already found
+-            if (hasMatcher && !hasAnyMatch && itemCounter > 0) {
+-                const jsonData = tryParse(line);
+-                if (jsonData) {
+-                    if (incrementalMatcher) {
+-                        hasAnyMatch = incrementalMatcher.test(jsonData.mes || '');
+-                    } else if (typeof matcher === 'function') {
+-                        matchBuffer.push(jsonData.mes || '');
+-                        hasAnyMatch = matcher(matchBuffer);
+-                    }
+-                    if (hasAnyMatch) {
+-                        matchBuffer = [];
+-                    }
++        }
++        itemCounter++;
++    };
++
++    try {
++        for await (const chunk of fileStream) {
++            let start = skipLineFeed && chunk[0] === 10 ? 1 : 0;
++            skipLineFeed = false;
++            let lineFeed = chunk.indexOf(10, start);
++            let carriageReturn = chunk.indexOf(13, start);
++
++            while (lineFeed !== -1 || carriageReturn !== -1) {
++                const end = lineFeed === -1 ? carriageReturn : carriageReturn === -1 ? lineFeed : Math.min(lineFeed, carriageReturn);
++                finishLine(chunk, start, end);
++                start = end + 1;
++                if (end === carriageReturn) {
++                    // readline treats CR, LF and CRLF as one line ending, even
++                    // when CRLF straddles two chunks (crlfDelay: Infinity).
++                    skipLineFeed = start === chunk.length;
++                    if (chunk[start] === 10) start++;
++                    carriageReturn = chunk.indexOf(13, start);
+                 }
++                lineFeed = chunk.indexOf(10, start);
+             }
+-            itemCounter++;
+-            lastLine = line;
+-        });
+-        rl.on('close', () => {
+-            if (finished) return;
+-            if (lastLine) {
+-                const jsonData = tryParse(lastLine);
+-                if (jsonData && (jsonData.name || jsonData.character_name || jsonData.chat_metadata)) {
+-                    chatData.chat_items = (itemCounter - 1);
+-                    chatData.mes = jsonData.mes || '[The message is empty]';
+-                    chatData.last_mes = jsonData.send_date || new Date(Math.round(stats.mtimeMs)).toISOString();
+-                    chatData.match = hasMatcher ? hasAnyMatch : true;
+-
+-                    finish(chatData);
+-                } else {
+-                    // The last line is unparseable or lacks known fields (e.g. a truncated write or an external edit).
+-                    // Resolve a degraded preview from the stat data instead of hiding an otherwise intact chat
+-                    // from the chat list, search and recents.
+-                    console.warn('Found an invalid or corrupted last line in a chat file:', pathToFile);
+-                    // Exclude both the metadata line and the unreadable trailing line.
+-                    chatData.chat_items = Math.max(itemCounter - 2, 0);
+-                    chatData.mes = '[The message is empty]';
+-                    chatData.match = hasMatcher ? hasAnyMatch : true;
+-                    finish(chatData);
+-                }
++            if (start < chunk.length) {
++                lineParts.push(chunk.subarray(start));
++                lineBytes += chunk.length - start;
++            }
++        }
++        if (lineBytes > 0) finishLine(Buffer.alloc(0), 0, 0);
++
++        if (lastLineBytes > 0) {
++            const jsonData = tryParse(decodeLastLine());
++            if (jsonData && (jsonData.name || jsonData.character_name || jsonData.chat_metadata)) {
++                chatData.chat_items = itemCounter - 1;
++                chatData.mes = jsonData.mes || '[The message is empty]';
++                chatData.last_mes = jsonData.send_date || new Date(Math.round(stats.mtimeMs)).toISOString();
++                chatData.match = hasMatcher ? hasAnyMatch : true;
+             } else {
+-                // The file was truncated after the stat reported a non-zero size; treat it like an empty chat
+-                finish(chatData);
++                // Preserve the degraded preview for an unreadable final line.
++                console.warn('Found an invalid or corrupted last line in a chat file:', pathToFile);
++                chatData.chat_items = Math.max(itemCounter - 2, 0);
++                chatData.mes = '[The message is empty]';
++                chatData.match = hasMatcher ? hasAnyMatch : true;
+             }
+-        });
+-    });
++        }
++        return chatData;
++    } catch (error) {
++        if (error.code === 'ENOENT') {
++            chatInfoCache.delete(pathToFile);
++            return null;
++        }
++        throw error;
++    } finally {
++        // Stream iteration can finish before its descriptor closes. Keep the
++        // cache's read slot until close, including errors and disappearing files.
++        fileStream.destroy();
++        await closed;
++    }
+ }
+ 
+ export const router = express.Router();
+@@ -1093,9 +1119,13 @@ router.post('/search', validateAvatarUrlMiddleware, async function (request, res
+             // The client cancels obsolete searches while typing or switching
+             // chats. Stop after the current file instead of scanning the rest.
+             if (response.destroyed) return;
+-            const matcher = query ? createChatSearchMatcher(fragments) : null;
++            // Filename and content matches are independent. If every fragment
++            // is already in the name, no message search is needed and an intact
++            // cached summary can satisfy the request without opening the file.
++            const fileNameMatch = hasTextMatch([path.parse(chatFile).name]);
++            const matcher = query && !fileNameMatch ? createChatSearchMatcher(fragments) : null;
+             const chatInfo = await getChatInfo(chatFile, {}, false, matcher);
+-            const hasMatch = chatInfo.match || hasTextMatch([chatInfo.file_id ?? '']);
++            const hasMatch = chatInfo.match || fileNameMatch;
+ 
+             // Skip corrupted or invalid chat files
+             if (!chatInfo.file_name) {
+diff --git a/tests/bench-chat-scans.mjs b/tests/bench-chat-scans.mjs
+new file mode 100644
+index 00000000..54bec90f
+--- /dev/null
++++ b/tests/bench-chat-scans.mjs
+@@ -0,0 +1,165 @@
++// Compare the JSONL scan paths against a local Git revision. Uses synthetic
++// fixtures only; neither a running server nor a provider connection is needed.
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++import { execFileSync } from 'node:child_process';
++import { performance } from 'node:perf_hooks';
++import { fileURLToPath } from 'node:url';
++import { parseArgs } from 'node:util';
++
++const { values } = parseArgs({
++    options: {
++        baseline: { type: 'string', default: '78a22e873' },
++        rounds: { type: 'string', default: '3' },
++        messages: { type: 'string', default: '10000' },
++        repeats: { type: 'string', default: '1024' },
++        charset: { type: 'string', default: 'both' },
++        help: { type: 'boolean', short: 'h' },
++    },
++});
++if (values.help) {
++    console.log('Usage: node tests/bench-chat-scans.mjs [--baseline REF] [--rounds N] [--messages N] [--repeats N] [--charset both|ascii|unicode]\n'
++        + 'Defaults: --baseline 78a22e873 --rounds 3 --messages 10000 --repeats 1024 --charset both\n'
++        + 'Each fixture is about 98 MiB by default. ASCII and multilingual bodies have equal byte lengths.\n'
++        + 'Reports wall time, process CPU, content bytes and open streams for summaries and searches.\n'
++        + 'Uses current supporting modules and dependencies for both endpoint versions. Temporary files are removed.');
++    process.exit(0);
++}
++const roundCount = Number(values.rounds);
++const messageCount = Number(values.messages);
++const repeats = Number(values.repeats);
++if (![roundCount, messageCount, repeats].every(value => Number.isSafeInteger(value) && value > 0)) {
++    throw new Error('Rounds, messages and repeats must be positive integers.');
++}
++if (!['both', 'ascii', 'unicode'].includes(values.charset)) throw new Error('Charset must be both, ascii or unicode.');
++const charsets = values.charset === 'both' ? ['ascii', 'unicode'] : [values.charset];
++const endpointUrl = new URL('../src/endpoints/chats.js', import.meta.url);
++const repository = fileURLToPath(new URL('../', import.meta.url));
++const gitOptions = { cwd: repository, encoding: /** @type {const} */ ('utf8') };
++const commit = execFileSync('git', ['rev-parse', '--verify', '--end-of-options', `${values.baseline}^{commit}`], gitOptions).trim();
++const source = execFileSync('git', ['show', `${commit}:src/endpoints/chats.js`], gitOptions);
++// Preserve the real endpoint code while giving a data URL the import context
++// of its original file. Supporting modules are deliberately shared.
++const resolvedSource = source.replace(/\bfrom\s+(['"])([^'"\r\n]+)\1(?=\s*;)/g, (_, quote, specifier) => {
++    const resolved = specifier.startsWith('.') || specifier.startsWith('/')
++        ? new URL(specifier, endpointUrl).href : import.meta.resolve(specifier);
++    return `from '${resolved}'`;
++});
++process.env.SILLYTAVERN_BACKUPS_CHAT_ENABLED = 'false';
++process.env.SILLYTAVERN_BACKUPS_CHAT_MAXTOTALBACKUPS = '-1';
++process.env.SILLYTAVERN_BACKUPS_CHAT_THROTTLEINTERVAL = '0';
++process.env.SILLYTAVERN_BACKUPS_CHAT_CHECKINTEGRITY = 'true';
++const implementations = {
++    baseline: await import('data:text/javascript;base64,' + Buffer.from(resolvedSource).toString('base64')),
++    current: await import(endpointUrl.href),
++};
++const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'st-bench-scans-'));
++const open = fs.createReadStream;
++let counters;
++fs.createReadStream = (...args) => {
++    const sample = counters;
++    sample.contentReads++;
++    sample.peakStreams = Math.max(sample.peakStreams, ++sample.activeStreams);
++    const stream = open(...args);
++    stream.once('close', () => {
++        sample.bytesRead += stream.bytesRead;
++        sample.activeStreams--;
++    });
++    return stream;
++};
++const rounded = value => +value.toFixed(2);
++const median = samples => {
++    const sorted = [...samples].sort((a, b) => a - b);
++    const middle = Math.floor(sorted.length / 2);
++    return rounded(sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2);
++};
++async function measure(operation) {
++    counters = { contentReads: 0, bytesRead: 0, activeStreams: 0, peakStreams: 0 };
++    const cpuStart = process.cpuUsage();
++    const start = performance.now();
++    const result = await operation();
++    // Include descriptor closure in both versions. Never reset counters while
++    // a prior stream still has an outstanding close event.
++    while (counters.activeStreams > 0) await new Promise(resolve => setImmediate(resolve));
++    const durationMs = rounded(performance.now() - start);
++    const cpu = process.cpuUsage(cpuStart);
++    return { result, metrics: { durationMs, cpuMs: rounded((cpu.user + cpu.system) / 1000), ...counters } };
++}
++
++try {
++    const results = [];
++    for (const charset of charsets) {
++        const body = (charset === 'ascii' ? 'abcdefghij' : '汉字🙂').repeat(repeats);
++        const message = JSON.stringify({ name: 'Character', mes: body, send_date: '2026-01-01' });
++        const firstMessage = JSON.stringify({ name: 'Character', mes: 'early needle ' + body, send_date: '2026-01-01' });
++        const contents = JSON.stringify({ chat_metadata: {} }) + '\n' + firstMessage + (messageCount > 1 ? '\n' + Array(messageCount - 1).fill(message).join('\n') : '');
++        const preview = messageCount > 1 ? body : 'early needle ' + body;
++        const rounds = [];
++        for (let round = 0; round < roundCount; round++) {
++            const roundRoot = path.join(root, `${charset}-${round}`);
++            const characterDirectory = path.join(roundRoot, 'Character');
++            await fs.promises.mkdir(characterDirectory, { recursive: true });
++            const file = path.join(characterDirectory, 'filename match.jsonl');
++            await fs.promises.writeFile(file, contents);
++            const order = round % 2 ? ['current', 'baseline'] : ['baseline', 'current'];
++            const roundResult = { round: round + 1, order };
++            for (const name of order) {
++                const implementation = implementations[name];
++                const phases = {};
++                for (const phase of ['summaryFirst', 'summaryRepeated', 'searchEarly', 'searchAbsent', 'filenameWarm']) {
++                    const measured = await measure(async () => {
++                        if (phase === 'filenameWarm') {
++                            const handler = implementation.router.stack.find(layer => layer.route?.path === '/search').route.stack.at(-1).handle;
++                            let result;
++                            await handler({ body: { query: 'filename match', avatar_url: 'Character.png' }, user: { directories: { chats: roundRoot } } }, {
++                                send(value) { result = value; },
++                                status(code) { throw new Error(`Search failed with status ${code}`); },
++                            });
++                            assert.equal(result.length, 1);
++                            assert.equal(result[0].message_count, messageCount);
++                            return;
++                        }
++                        const matcher = phase === 'searchEarly' ? implementation.createChatSearchMatcher(['early', 'needle'])
++                            : phase === 'searchAbsent' ? implementation.createChatSearchMatcher(['never-present']) : null;
++                        const result = await implementation.getChatInfo(file, {}, false, matcher);
++                        assert.equal(result.chat_items, messageCount);
++                        assert.equal(result.mes, preview);
++                        assert.equal(result.match, phase !== 'searchAbsent');
++                    });
++                    phases[phase] = measured.metrics;
++                }
++                roundResult[name] = phases;
++            }
++            rounds.push(roundResult);
++            await fs.promises.rm(roundRoot, { recursive: true, force: true });
++        }
++        const summary = {};
++        for (const name of Object.keys(implementations)) {
++            summary[name] = {};
++            for (const phase of Object.keys(rounds[0][name])) {
++                const samples = rounds.map(round => round[name][phase]);
++                summary[name][phase] = {
++                    medianMs: median(samples.map(sample => sample.durationMs)),
++                    medianCpuMs: median(samples.map(sample => sample.cpuMs)),
++                    minMs: Math.min(...samples.map(sample => sample.durationMs)),
++                    maxMs: Math.max(...samples.map(sample => sample.durationMs)),
++                    bytesReadPerRound: samples.map(sample => sample.bytesRead),
++                    peakStreams: Math.max(...samples.map(sample => sample.peakStreams)),
++                };
++            }
++        }
++        results.push({ charset, inputMiB: rounded(Buffer.byteLength(contents) / 1024 / 1024), summary, rounds });
++    }
++    console.log(JSON.stringify({
++        baseline: { ref: values.baseline, commit, scope: 'Git endpoint with current supporting modules and dependencies' },
++        messages: messageCount,
++        repeats,
++        note: 'OS disk cache is not cleared. First means no retained application summary. CPU is process user+system time. Both timings include stream closure. Filename searches start with a valid cached summary. Workload and machine contention affect results.',
++        results,
++    }, null, 2));
++} finally {
++    fs.createReadStream = open;
++    await fs.promises.rm(root, { recursive: true, force: true });
++}
+diff --git a/tests/chat-byte-scan.node.mjs b/tests/chat-byte-scan.node.mjs
+new file mode 100644
+index 00000000..507b162b
+--- /dev/null
++++ b/tests/chat-byte-scan.node.mjs
+@@ -0,0 +1,115 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++import fs from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++import readline from 'node:readline';
++import { Readable } from 'node:stream';
++
++process.env.SILLYTAVERN_BACKUPS_CHAT_ENABLED = 'false';
++process.env.SILLYTAVERN_BACKUPS_CHAT_MAXTOTALBACKUPS = '-1';
++process.env.SILLYTAVERN_BACKUPS_CHAT_THROTTLEINTERVAL = '0';
++process.env.SILLYTAVERN_BACKUPS_CHAT_CHECKINTEGRITY = 'true';
++const { getChatInfo, createChatSearchMatcher } = await import('../src/endpoints/chats.js');
++
++const metadata = { note: '魔女🙂 metadata' };
++const header = JSON.stringify({ chat_metadata: metadata });
++const message = text => JSON.stringify({ name: 'Character', mes: text, send_date: '2026-01-01' });
++
++async function directory(t) {
++    const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'st-byte-scan-'));
++    t.after(() => fs.promises.rm(root, { recursive: true, force: true }));
++    return root;
++}
++
++test('byte scanning preserves readline counts, previews and metadata across UTF-8 and line-ending boundaries', async (t) => {
++    const root = await directory(t);
++    const open = fs.createReadStream;
++    let chunkSize = 1;
++    t.mock.method(fs, 'createReadStream', (file, options) => open(file, { ...options, highWaterMark: chunkSize }));
++    let index = 0;
++    const variants = [
++        [header, message('first 魔女🙂'), message('last 汉字🚀')],
++        [header, '', message('last 汉字🚀')],
++        [header],
++        [''],
++    ];
++    for (chunkSize of [1, 2, 3, 7, 64]) {
++        for (const ending of ['\n', '\r', '\r\n']) {
++            for (const lines of variants) {
++                for (const suffix of ['', ending, ending + ending]) {
++                    const contents = lines.join(ending) + suffix;
++                    const file = path.join(root, `${index++}.jsonl`);
++                    await fs.promises.writeFile(file, contents);
++                    // Native readline is the compatibility oracle for line
++                    // boundaries, including its treatment of trailing blanks.
++                    const referenceLines = [];
++                    const reader = readline.createInterface({ input: Readable.from([Buffer.from(contents)]), crlfDelay: Infinity });
++                    for await (const line of reader) referenceLines.push(line);
++                    const lastLine = referenceLines.at(-1);
++                    const expected = lastLine ? JSON.parse(lastLine) : null;
++                    const actual = await getChatInfo(file, {}, true);
++                    const context = JSON.stringify({ chunkSize, ending, lines, suffix });
++                    assert.equal(actual.chat_items, expected ? referenceLines.length - 1 : 0, context);
++                    assert.equal(actual.mes, expected ? expected.mes || '[The message is empty]' : '[The chat is empty]', context);
++                    assert.equal(actual.match, !!expected, context);
++                    assert.deepEqual(actual.chat_metadata, referenceLines[0] === header ? metadata : undefined, context);
++                }
++            }
++        }
++    }
++});
++
++test('mixed CR/LF endings and malformed UTF-8 retain literal search and preview behavior', async (t) => {
++    const root = await directory(t);
++    const open = fs.createReadStream;
++    t.mock.method(fs, 'createReadStream', (file, options) => open(file, { ...options, highWaterMark: 1 }));
++    const file = path.join(root, 'mixed.jsonl');
++    const contents = Buffer.concat([
++        Buffer.from(header + '\r\n' + message('ALPHA 魔女🙂') + '\r\n\r' + message('beta') + '\n{"name":"Character","mes":"'),
++        Buffer.from([0xe2, 0x82]), // Truncated UTF-8 sequence inside valid JSON.
++        Buffer.from(' final","send_date":"2026-01-01"}\r\n'),
++    ]);
++    await fs.promises.writeFile(file, contents);
++    const visited = [];
++    const matching = createChatSearchMatcher(['alpha', 'beta']);
++    const result = await getChatInfo(file, {}, true, { test(text) { visited.push(text); return matching.test(text); } });
++    assert.equal(result.chat_items, 4);
++    assert.equal(result.mes, '\ufffd final');
++    assert.equal(result.match, true);
++    assert.deepEqual(visited, ['ALPHA 魔女🙂', 'beta']);
++    assert.equal((await getChatInfo(file, {}, false, createChatSearchMatcher(['\ufffd final']))).match, true);
++    assert.equal((await getChatInfo(file, {}, false, createChatSearchMatcher(['metadata']))).match, false);
++});
++
++test('multi-megabyte metadata and final messages span many chunks without losing text', async (t) => {
++    const root = await directory(t);
++    const open = fs.createReadStream;
++    t.mock.method(fs, 'createReadStream', (file, options) => open(file, { ...options, highWaterMark: 4096 }));
++    const file = path.join(root, 'long.jsonl');
++    const longText = '汉字🙂'.repeat(256 * 1024);
++    await fs.promises.writeFile(file, JSON.stringify({ chat_metadata: { note: longText } }) + '\r\n' + message('early match') + '\n' + message(longText));
++    const result = await getChatInfo(file, {}, true, createChatSearchMatcher(['early']));
++    assert.equal(result.chat_items, 2);
++    assert.equal(result.mes, longText);
++    assert.equal(result.chat_metadata.note, longText);
++    assert.equal(result.match, true);
++});
++
++test('a throwing matcher closes the stream and leaves summary reads usable', async (t) => {
++    const root = await directory(t);
++    const file = path.join(root, 'retry.jsonl');
++    await fs.promises.writeFile(file, header + '\n' + message('first') + '\n' + message('last'));
++    const open = fs.createReadStream;
++    const opened = [];
++    t.mock.method(fs, 'createReadStream', (...args) => {
++        const stream = open(...args);
++        opened.push(stream);
++        return stream;
++    });
++    const failure = new Error('matcher failure');
++    await assert.rejects(getChatInfo(file, {}, false, { test() { throw failure; } }), failure);
++    assert.ok(opened.every(stream => stream.closed));
++    assert.equal((await getChatInfo(file)).mes, 'last');
++    assert.ok(opened.every(stream => stream.closed));
++});
+diff --git a/tests/chat-search.node.mjs b/tests/chat-search.node.mjs
+index 3f72ade4..db778f87 100644
+--- a/tests/chat-search.node.mjs
++++ b/tests/chat-search.node.mjs
+@@ -1,8 +1,10 @@
+ import assert from 'node:assert/strict';
+ import test from 'node:test';
+ import fs from 'node:fs/promises';
++import syncFs from 'node:fs';
+ import os from 'node:os';
+ import path from 'node:path';
++import express from 'express';
+ 
+ process.env.SILLYTAVERN_BACKUPS_CHAT_ENABLED = 'false';
+ process.env.SILLYTAVERN_BACKUPS_CHAT_MAXTOTALBACKUPS = '-1';
+@@ -122,3 +124,46 @@ test('a disconnected search stops scanning after the current file', async (t) =>
+     await handler({ body: { query: 'alpha', avatar_url: 'Character.png' }, user: { directories: { chats: root } } }, response);
+     assert.equal(inspectedFiles, 1);
+ });
++
++test('HTTP filename searches reuse summaries, invalidate edits and keep content matching independent', async (t) => {
++    const root = await directory(t);
++    const character = path.join(root, 'Character');
++    await fs.mkdir(character);
++    const file = path.join(character, 'alpha beta.jsonl');
++    await fs.writeFile(file, jsonl(['original preview']));
++    const app = express();
++    app.use(express.json());
++    app.use((request, response, next) => {
++        request.user = /** @type {any} */ ({ directories: { chats: root } });
++        next();
++    });
++    app.use('/api/chats', router);
++    const server = app.listen(0, '127.0.0.1');
++    await new Promise(resolve => server.once('listening', resolve));
++    t.after(() => new Promise(resolve => server.close(resolve)));
++    const address = server.address();
++    assert.ok(address && typeof address === 'object');
++    const search = async query => {
++        const response = await fetch(`http://127.0.0.1:${address.port}/api/chats/search`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({ query, avatar_url: 'Character.png' }),
++        });
++        assert.equal(response.status, 200);
++        return response.json();
++    };
++    const open = syncFs.createReadStream;
++    let reads = 0;
++    t.mock.method(syncFs, 'createReadStream', (...args) => { reads++; return open(...args); });
++    assert.equal((await search(''))[0].preview_message, 'original preview');
++    assert.equal(reads, 1);
++    assert.equal((await search('ALPHA beta'))[0].preview_message, 'original preview');
++    assert.equal(reads, 1, 'A complete filename match should reuse the summary without content I/O');
++    await fs.writeFile(file, jsonl(['edited preview']));
++    assert.equal((await search('ALPHA beta'))[0].preview_message, 'edited preview');
++    assert.equal(reads, 2);
++    assert.deepEqual(await search('alpha edited'), [], 'Filename and message fragments remain independent');
++    assert.equal(reads, 3);
++    assert.equal((await search('edited preview'))[0].file_name, 'alpha beta');
++    assert.equal(reads, 4, 'Content queries must inspect messages even when a summary is cached');
++});

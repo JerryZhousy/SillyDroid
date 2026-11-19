@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Thu, 22 Oct 2026 20:11:52 +0900
+Subject: [PATCH 17/31] Preserve indexed span semantics for extension-provided
+ iterators
+
+---
+ public/scripts/util/showdown-patch.js |  4 ++--
+ tests/showdown-patch.node.mjs         | 18 ++++++++++++++++--
+ 2 files changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/public/scripts/util/showdown-patch.js b/public/scripts/util/showdown-patch.js
+index 5e1ac144..9e85608b 100644
+--- a/public/scripts/util/showdown-patch.js
++++ b/public/scripts/util/showdown-patch.js
+@@ -39,8 +39,8 @@ export function addShowdownPatch(showdown) {
+             }
+         }
+         if (canReplaceTogether) {
+-            for (const span of spans) {
+-                let replacement = span;
++            for (let index = 0; index < spans.length; index++) {
++                let replacement = spans[index];
+                 let limit = 0;
+                 while (/¨C(\d+)C/.test(replacement)) {
+                     const nestedIndex = RegExp.$1;
+diff --git a/tests/showdown-patch.node.mjs b/tests/showdown-patch.node.mjs
+index f32490ec..0244b8fe 100644
+--- a/tests/showdown-patch.node.mjs
++++ b/tests/showdown-patch.node.mjs
+@@ -53,11 +53,11 @@ test('span expansion matches ordered replacement for nested, duplicated and lite
+         ['¨C0C1C', ['¨C', '<em>assembled token</em>']],
+         ['¨C¨C0C', ['1C', '<em>assembled token</em>']],
+         ['before ¨C0C middle ¨C1C after', ['<q>$&</q>', '<b>$$</b>']],
+-        ['before ¨C0C middle ¨C1C after', ['<q>$`</q>', "<b>$'</b>"]],
++        ['before ¨C0C middle ¨C1C after', ['<q>$`</q>', '<b>$\'</b>']],
+         ['¨C1C', ['<q>$&</q>', '<b>¨C0C</b>']],
+         ['¨C0C ¨C1C', ['<q>$1 and $0 stay literal</q>', '<b>cost $5</b>']],
+         ['¨C0C', Object.assign(['<q>¨C01C</q>'], { '01': '$$&' })],
+-        ['¨C0C', Object.assign(['<q>¨C01C</q>'], { '01': "$$'" })],
++        ['¨C0C', Object.assign(['<q>¨C01C</q>'], { '01': '$$\'' })],
+         ['¨C0C', Object.assign(['<q>¨C01C</q>'], { '01': '$$`' })],
+     ];
+     for (const [text, spans] of cases) {
+@@ -83,6 +83,20 @@ test('extension dispatch may rewrite text and spans and invoke the parser reentr
+     assert.deepEqual(run(optimizedUnhash, '¨C0C', [], replaceSpanTable), run(originalUnhash, '¨C0C', [], replaceSpanTable));
+ });
+ 
++test('extension-provided iterators do not override numerically indexed spans', () => {
++    const dispatch = (event, text, _options, globals) => {
++        if (event.endsWith('.before')) {
++            globals.gHtmlSpans[Symbol.iterator] = function* () {
++                yield '<q>iterator value</q>';
++            };
++        }
++        return text;
++    };
++    const expected = run(originalUnhash, '¨C0C', ['<q>indexed value</q>'], dispatch);
++    assert.equal(expected.html, '<q>indexed value</q>');
++    assert.deepEqual(run(optimizedUnhash, '¨C0C', ['<q>indexed value</q>'], dispatch), expected);
++});
++
+ test('cyclic references retain the previous nesting limit and diagnostic', () => {
+     const previousError = console.error;
+     const errors = [];

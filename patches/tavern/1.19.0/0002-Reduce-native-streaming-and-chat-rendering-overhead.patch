@@ -1,0 +1,231 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shalistera <119715343+Shalistera@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 20:02:54 +0900
+Subject: [PATCH 02/31] Reduce native streaming and chat rendering overhead
+
+---
+ public/script.js                     | 15 ++++------
+ public/scripts/reasoning.js          | 16 +++++------
+ public/scripts/util/message-depth.js | 22 +++++++++++++++
+ public/scripts/util/stream-fadein.js | 27 ++++++++++++++++++
+ tests/message-depth.node.mjs         | 42 ++++++++++++++++++++++++++++
+ 5 files changed, 105 insertions(+), 17 deletions(-)
+ create mode 100644 public/scripts/util/message-depth.js
+ create mode 100644 tests/message-depth.node.mjs
+
+diff --git a/public/script.js b/public/script.js
+index 777a2d59..b50ff658 100644
+--- a/public/script.js
++++ b/public/script.js
+@@ -277,7 +277,8 @@ import { clearItemizedPrompts, deleteItemizedPromptForMessage, deleteItemizedPro
+ import { getSystemMessageByType, initSystemMessages, SAFETY_CHAT, sendSystemMessage, system_message_types, system_messages } from './scripts/system-messages.js';
+ import { event_types, eventSource } from './scripts/events.js';
+ import { initAccessibility } from './scripts/a11y.js';
+-import { applyStreamFadeIn } from './scripts/util/stream-fadein.js';
++import { createStreamingContentUpdater } from './scripts/util/stream-fadein.js';
++import { getMessageDepth } from './scripts/util/message-depth.js';
+ import { initDomHandlers } from './scripts/dom-handlers.js';
+ import { SimpleMutex } from './scripts/util/SimpleMutex.js';
+ import { AudioPlayer } from './scripts/audio-player.js';
+@@ -1848,9 +1849,7 @@ export function messageFormatting(mes, ch_name, isSystem, isUser, messageId, san
+         }
+ 
+         const regexPlacement = getRegexPlacement();
+-        const usableMessages = chat.map((x, index) => ({ message: x, index: index })).filter(x => !x.message.is_system);
+-        const indexOf = usableMessages.findIndex(x => x.index === Number(messageId));
+-        const depth = messageId >= 0 && indexOf !== -1 ? (usableMessages.length - indexOf - 1) : undefined;
++        const depth = getMessageDepth(chat, messageId);
+ 
+         mes = MessageFormatter.runStage(MessageFormatter.stage.BEFORE_REGEX, mes,
+             { ch_name, isSystem, isUser, messageId, isReasoning },
+@@ -3538,6 +3537,8 @@ function hideStopButton() {
+ }
+ 
+ class StreamingProcessor {
++    #updateStreamingContent = createStreamingContentUpdater();
++
+     /**
+      * Creates a new streaming processor.
+      * @param {string} type Generation type
+@@ -3722,11 +3723,7 @@ class StreamingProcessor {
+                 false,
+             );
+             if (this.messageTextDom instanceof HTMLElement) {
+-                if (power_user.stream_fade_in) {
+-                    applyStreamFadeIn(this.messageTextDom, formattedText);
+-                } else {
+-                    this.messageTextDom.innerHTML = formattedText;
+-                }
++                this.#updateStreamingContent(this.messageTextDom, formattedText, power_user.stream_fade_in, isFinal);
+             }
+ 
+             const timePassed = formatGenerationTimer(this.timeStarted, currentTime, currentTokenCount, this.reasoningHandler.getDuration(), this.timeToFirstToken);
+diff --git a/public/scripts/reasoning.js b/public/scripts/reasoning.js
+index c82e95fc..1eb4f367 100644
+--- a/public/scripts/reasoning.js
++++ b/public/scripts/reasoning.js
+@@ -15,7 +15,7 @@ import { commonEnumProviders, enumIcons } from './slash-commands/SlashCommandCom
+ import { enumTypes, SlashCommandEnumValue } from './slash-commands/SlashCommandEnumValue.js';
+ import { SlashCommandParser } from './slash-commands/SlashCommandParser.js';
+ import { textgen_types, textgenerationwebui_settings } from './textgen-settings.js';
+-import { applyStreamFadeIn } from './util/stream-fadein.js';
++import { createStreamingContentUpdater } from './util/stream-fadein.js';
+ import { copyText, escapeRegex, isFalseBoolean, isTrueBoolean, setDatasetProperty, stringToRange, trimSpaces } from './utils.js';
+ 
+ /**
+@@ -274,6 +274,8 @@ export const ReasoningState = {
+  * This class is used inside the {@link StreamingProcessor} to manage reasoning states and UI updates.
+  */
+ export class ReasoningHandler {
++    #updateStreamingContent = createStreamingContentUpdater();
++
+     /** @type {boolean} True if the model supports reasoning, but hides the reasoning output */
+     #isHiddenReasoningModel;
+     /** @type {boolean} True if the handler is currently handling a manual parse of reasoning blocks */
+@@ -549,7 +551,7 @@ export class ReasoningHandler {
+             await eventSource.emit(event_types.STREAM_REASONING_DONE, this.reasoning, this.getDuration(), messageId, this.state);
+         }
+ 
+-        this.updateDom(messageId);
++        this.updateDom(messageId, { force: true });
+     }
+ 
+     /**
+@@ -558,8 +560,10 @@ export class ReasoningHandler {
+      * Toggles the CSS class, updates states, reasoning message, and duration.
+      *
+      * @param {number} messageId - The ID of the message to update
++     * @param {object} [options] Content update options
++     * @param {boolean} [options.force=false] Force final content reconciliation
+      */
+-    updateDom(messageId) {
++    updateDom(messageId, { force = false } = {}) {
+         this.#checkDomElements(messageId);
+ 
+         // Main CSS class to show this message includes reasoning
+@@ -579,11 +583,7 @@ export class ReasoningHandler {
+         setDatasetProperty(this.messageReasoningDetailsDom, 'hasContent', hasReasoningContent ? 'true' : null);
+         const displayReasoning = messageFormatting(reasoning, '', false, false, messageId, {}, true);
+ 
+-        if (power_user.stream_fade_in) {
+-            applyStreamFadeIn(this.messageReasoningContentDom, displayReasoning);
+-        } else {
+-            this.messageReasoningContentDom.innerHTML = displayReasoning;
+-        }
++        this.#updateStreamingContent(this.messageReasoningContentDom, displayReasoning, power_user.stream_fade_in, force);
+ 
+         // Update tooltip for hidden reasoning edit
+         /** @type {HTMLElement} */
+diff --git a/public/scripts/util/message-depth.js b/public/scripts/util/message-depth.js
+new file mode 100644
+index 00000000..d225e364
+--- /dev/null
++++ b/public/scripts/util/message-depth.js
+@@ -0,0 +1,22 @@
++/**
++ * Counts non-system messages after a message, as used by regex depth limits.
++ * Scanning only the suffix makes streaming the last message independent of
++ * history length. Recompute from live data so edits and reordering stay visible.
++ * @param {{ is_system?: boolean }[]} messages Chat messages
++ * @param {number|string} messageId Absolute message index
++ * @returns {number|undefined} Depth, or undefined for system/transient messages
++ */
++export function getMessageDepth(messages, messageId) {
++    const index = Number(messageId);
++    if (!Number.isInteger(index) || index < 0 || index >= messages.length || !messages[index] || messages[index].is_system) {
++        return undefined;
++    }
++
++    let depth = 0;
++    for (let i = index + 1; i < messages.length; i++) {
++        if (messages[i] && !messages[i].is_system) {
++            depth++;
++        }
++    }
++    return depth;
++}
+diff --git a/public/scripts/util/stream-fadein.js b/public/scripts/util/stream-fadein.js
+index 20e74e73..fd76831f 100644
+--- a/public/scripts/util/stream-fadein.js
++++ b/public/scripts/util/stream-fadein.js
+@@ -1,5 +1,32 @@
+ import { morphdom } from '../../lib.js';
+ 
++/**
++ * Creates a content writer scoped to one streaming handler.
++ * Formatting still runs on every update; only identical DOM writes are skipped.
++ * @returns {(element: HTMLElement, html: string, fade: boolean, force?: boolean) => boolean} Whether content was written
++ */
++export function createStreamingContentUpdater() {
++    /** @type {HTMLElement|null} */
++    let lastElement = null;
++    let lastHtml;
++    let lastFade;
++
++    return (element, html, fade, force = false) => {
++        if (!force && element === lastElement && html === lastHtml && fade === lastFade) {
++            return false;
++        }
++        if (fade) {
++            applyStreamFadeIn(element, html);
++        } else {
++            element.innerHTML = html;
++        }
++        lastElement = element;
++        lastHtml = html;
++        lastFade = fade;
++        return true;
++    };
++}
++
+ /**
+  * Check if the current browser supports native segmentation function.
+  * @returns {boolean} True if the Segmenter is supported by the current browser.
+diff --git a/tests/message-depth.node.mjs b/tests/message-depth.node.mjs
+new file mode 100644
+index 00000000..91b6af2b
+--- /dev/null
++++ b/tests/message-depth.node.mjs
+@@ -0,0 +1,42 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++import { getMessageDepth } from '../public/scripts/util/message-depth.js';
++
++function originalDepth(chat, messageId) {
++    const usableMessages = chat.map((x, index) => ({ message: x, index })).filter(x => !x.message.is_system);
++    const indexOf = usableMessages.findIndex(x => x.index === Number(messageId));
++    return messageId >= 0 && indexOf !== -1 ? usableMessages.length - indexOf - 1 : undefined;
++}
++
++test('depth matches the original for system messages, numeric IDs and transient messages', () => {
++    for (let flags = 0; flags < 256; flags++) {
++        const chat = Array.from({ length: 8 }, (_, i) => ({ is_system: Boolean(flags & (1 << i)) }));
++        for (const id of [-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, '3', '', null, undefined, NaN, Infinity, 1.5]) {
++            assert.equal(getMessageDepth(chat, id), originalDepth(chat, id));
++        }
++    }
++    assert.equal(getMessageDepth([], 0), undefined);
++});
++
++test('depth follows insertion, deletion, system toggles, reordering and chat switches immediately', () => {
++    let chat = [{}, { is_system: true }, {}, {}];
++    const check = () => chat.forEach((_, id) => assert.equal(getMessageDepth(chat, id), originalDepth(chat, id)));
++    check();
++    chat.splice(1, 0, {});
++    check();
++    chat.splice(3, 1);
++    check();
++    chat[1].is_system = true;
++    check();
++    chat.reverse();
++    check();
++    chat = [{}, {}, { is_system: true }];
++    check();
++});
++
++test('formatting the tail does not inspect older history', () => {
++    const chat = Array.from({ length: 10000 }, () => ({}));
++    Object.defineProperty(chat[0], 'is_system', { get() { throw new Error('Older history was inspected'); } });
++    assert.equal(getMessageDepth(chat, 9999), 0);
++    assert.equal(getMessageDepth(chat, 9997), 2);
++});

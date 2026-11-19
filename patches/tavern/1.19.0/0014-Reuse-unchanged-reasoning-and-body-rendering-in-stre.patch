@@ -1,0 +1,197 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Thu, 22 Oct 2026 19:53:08 +0900
+Subject: [PATCH 14/31] Reuse unchanged reasoning and body rendering in
+ streaming panels
+
+---
+ public/scripts/streaming-display.js    |  19 +++-
+ tests/frontend/StreamingDisplay.e2e.js | 121 +++++++++++++++++++++++++
+ 2 files changed, 138 insertions(+), 2 deletions(-)
+ create mode 100644 tests/frontend/StreamingDisplay.e2e.js
+
+diff --git a/public/scripts/streaming-display.js b/public/scripts/streaming-display.js
+index 8a378e01..b7936696 100644
+--- a/public/scripts/streaming-display.js
++++ b/public/scripts/streaming-display.js
+@@ -20,6 +20,8 @@
+ 
+ import { SVGInject } from '../lib.js';
+ import { t } from './i18n.js';
++import { MarkdownRenderCache } from './util/markdown-cache.js';
++import { createStreamingContentUpdater } from './util/stream-fadein.js';
+ import { animation_duration, messageFormatting } from '/script.js';
+ 
+ /** CSS class prefix */
+@@ -33,6 +35,10 @@ const CSS_PREFIX = 'streaming-display';
+  */
+ 
+ export class StreamingDisplay {
++    #reasoningMarkdownCache = new MarkdownRenderCache();
++    #textMarkdownCache = new MarkdownRenderCache();
++    #updateReasoningContent = createStreamingContentUpdater();
++    #updateTextContent = createStreamingContentUpdater();
+     /** @type {HTMLElement | null} */
+     #element = null;
+     /** @type {HTMLElement | null} */
+@@ -262,7 +268,8 @@ export class StreamingDisplay {
+         if (!this.#reasoningContent || !this.#reasoningSection || !text) return this;
+ 
+         this.#reasoningSection.style.display = '';
+-        this.#reasoningContent.innerHTML = messageFormatting(text, '', false, false, -1, {}, true);
++        const html = messageFormatting(text, '', false, false, -1, {}, true, this.#reasoningMarkdownCache);
++        this.#updateReasoningContent(this.#reasoningContent, html, false);
+         this.#reasoningContent.scrollTop = this.#reasoningContent.scrollHeight;
+         return this;
+     }
+@@ -278,7 +285,8 @@ export class StreamingDisplay {
+ 
+         this.#hasContent = true;
+         this.#textSection.style.display = '';
+-        this.#textContent.innerHTML = messageFormatting(text, '', false, false, -1, {}, false);
++        const html = messageFormatting(text, '', false, false, -1, {}, false, this.#textMarkdownCache);
++        this.#updateTextContent(this.#textContent, html, false);
+         this.#textContent.scrollTop = this.#textContent.scrollHeight;
+         return this;
+     }
+@@ -395,6 +403,13 @@ export class StreamingDisplay {
+ 
+         const el = this.#element;
+ 
++        this.#reasoningMarkdownCache.clear();
++        this.#textMarkdownCache.clear();
++        // Release detached DOM references and start fresh when this instance is
++        // shown again, even if the next generation has identical initial text.
++        this.#updateReasoningContent = createStreamingContentUpdater();
++        this.#updateTextContent = createStreamingContentUpdater();
++
+         // Clear all private fields
+         this.#element = null;
+         this.#labelElement = null;
+diff --git a/tests/frontend/StreamingDisplay.e2e.js b/tests/frontend/StreamingDisplay.e2e.js
+new file mode 100644
+index 00000000..86a7784e
+--- /dev/null
++++ b/tests/frontend/StreamingDisplay.e2e.js
+@@ -0,0 +1,121 @@
++import { test, expect } from '@playwright/test';
++import { testSetup } from './frontent-test-utils.js';
++
++test.beforeEach(testSetup.awaitST);
++
++test('unchanged panel text reuses Markdown and DOM while regexes, hooks and sanitization stay live', async ({ page }) => {
++    const result = await page.evaluate(async () => {
++        const { StreamingDisplay } = await import('/scripts/streaming-display.js');
++        const st = await import('/script.js');
++        const { power_user } = await import('/scripts/power-user.js');
++        const { extension_settings } = await import('/scripts/extensions.js');
++        const { MessageFormatter } = await import('/scripts/message-formatter.js');
++        const { showdown, DOMPurify } = await import('/lib.js');
++        power_user.markdown_escape_strings = '';
++        extension_settings.regex = [];
++
++        let conversions = 0;
++        const NativeConverter = showdown.Converter;
++        try {
++            showdown.Converter = function (...args) {
++                const converter = new NativeConverter(...args);
++                const makeHtml = converter.makeHtml;
++                converter.makeHtml = function (...args) {
++                    conversions++;
++                    return makeHtml.apply(this, args);
++                };
++                return converter;
++            };
++            st.reloadMarkdownProcessor();
++        } finally {
++            showdown.Converter = NativeConverter;
++        }
++        let hooks = 0;
++        let marker = 'initial';
++        MessageFormatter.addHook(html => {
++            hooks++;
++            return `${html}<span data-panel-hook="${marker}">hook</span><img src="x" onerror="window.unsafePanel=true">`;
++        });
++        let sanitizations = 0;
++        const sanitize = DOMPurify.sanitize;
++        DOMPurify.sanitize = function (...args) {
++            sanitizations++;
++            return sanitize.apply(this, args);
++        };
++        const display = new StreamingDisplay().show();
++        try {
++            display.updateReasoning('**Thinking** placeholder').updateContent('**Body** placeholder');
++            const reasoning = document.querySelector('.streaming-display-reasoning-content strong');
++            const body = document.querySelector('.streaming-display-text-content strong');
++            for (let index = 0; index < 5; index++) {
++                display.updateReasoning('**Thinking** placeholder').updateContent('**Body** placeholder');
++            }
++            const repeated = {
++                conversions, hooks, sanitizations,
++                stableReasoning: document.querySelector('.streaming-display-reasoning-content strong') === reasoning,
++                stableBody: document.querySelector('.streaming-display-text-content strong') === body,
++            };
++            marker = 'updated';
++            display.updateReasoning('**Thinking** placeholder').updateContent('**Body** placeholder');
++            const afterHook = {
++                conversions, hooks, sanitizations,
++                markers: [...document.querySelectorAll('[data-panel-hook]')].map(node => node.dataset.panelHook),
++                unsafe: !!document.querySelector('.streaming-display [onerror]'),
++            };
++            extension_settings.regex = [{
++                id: 'panel-regex', scriptName: 'Panel test', findRegex: '/placeholder/g',
++                replaceString: 'changed by regex', trimStrings: [], placement: [2],
++                disabled: false, markdownOnly: true, promptOnly: false,
++                runOnEdit: true, substituteRegex: 0, minDepth: null, maxDepth: null,
++            }];
++            display.updateContent('**Body** placeholder');
++            return { repeated, afterHook, afterRegex: { conversions, hooks, sanitizations, text: document.querySelector('.streaming-display-text-content').textContent } };
++        } finally {
++            DOMPurify.sanitize = sanitize;
++            display.hide({ instant: true });
++        }
++    });
++    expect(result.repeated).toEqual({ conversions: 2, hooks: 12, sanitizations: 12, stableReasoning: true, stableBody: true });
++    expect(result.afterHook).toEqual({ conversions: 2, hooks: 14, sanitizations: 14, markers: ['updated', 'updated'], unsafe: false });
++    expect(result.afterRegex).toMatchObject({ conversions: 3, hooks: 15, sanitizations: 15 });
++    expect(result.afterRegex.text).toContain('changed by regex');
++});
++
++test('hidden and reused panels reset cached content and keep separate instances independent', async ({ page }) => {
++    const result = await page.evaluate(async () => {
++        const { StreamingDisplay } = await import('/scripts/streaming-display.js');
++        const first = new StreamingDisplay().show({ label: 'first' });
++        const firstElement = document.querySelector('.streaming-display');
++        first.updateContent('**First answer**').updateReasoning('First thought');
++        const originalBody = firstElement.querySelector('.streaming-display-text-content strong');
++        const second = new StreamingDisplay().show({ label: 'second' });
++        second.updateContent('**Second answer**');
++        first.updateContent('**First answer**');
++        const independent = [...document.querySelectorAll('.streaming-display-text-content')].map(node => node.textContent);
++        first.updateContent('').updateReasoning('');
++        const emptyIgnored = firstElement.querySelector('.streaming-display-text-content').textContent;
++        first.complete({ delay: null });
++        const complete = first.isComplete;
++        first.hide({ instant: true });
++        first.updateContent('Must stay hidden');
++        const hidden = { hasContent: first.hasContent, complete: first.isComplete, stopped: first.isStopped };
++        first.show({ label: 'reused' });
++        const reused = [...document.querySelectorAll('.streaming-display')].at(-1);
++        const reset = { hasContent: first.hasContent, text: reused.querySelector('.streaming-display-text-content').textContent, reasoning: reused.querySelector('.streaming-display-reasoning-content').textContent };
++        first.updateContent('**First answer**');
++        const restored = { text: reused.querySelector('.streaming-display-text-content').textContent, newNode: reused.querySelector('.streaming-display-text-content strong') !== originalBody };
++        first.markStopped();
++        const stopped = first.isStopped;
++        first.show();
++        const restarted = { stopped: first.isStopped, hasContent: first.hasContent };
++        first.hide({ instant: true });
++        second.hide({ instant: true });
++        return { independent, emptyIgnored, complete, hidden, reset, restored, stopped, restarted };
++    });
++    expect(result).toEqual({
++        independent: ['First answer', 'Second answer'], emptyIgnored: 'First answer', complete: true,
++        hidden: { hasContent: false, complete: false, stopped: false },
++        reset: { hasContent: false, text: '', reasoning: '' }, restored: { text: 'First answer', newNode: true },
++        stopped: true, restarted: { stopped: false, hasContent: false },
++    });
++});

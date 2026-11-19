@@ -1,0 +1,1050 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Thu, 22 Oct 2026 21:05:37 +0900
+Subject: [PATCH 27/31] Load and persist token counts per chat with bounded
+ resident caches
+
+---
+ public/scripts/tokenizers.js            | 279 +++++++++++++-----------
+ public/scripts/util/chat-token-cache.js | 141 ++++++++++++
+ tests/bench-token-cache.mjs             |  77 +++++++
+ tests/chat-token-cache.node.mjs         | 209 ++++++++++++++++++
+ tests/frontend/ChatTokenCache.e2e.js    | 155 +++++++++++++
+ 5 files changed, 731 insertions(+), 130 deletions(-)
+ create mode 100644 public/scripts/util/chat-token-cache.js
+ create mode 100644 tests/bench-token-cache.mjs
+ create mode 100644 tests/chat-token-cache.node.mjs
+ create mode 100644 tests/frontend/ChatTokenCache.e2e.js
+
+diff --git a/public/scripts/tokenizers.js b/public/scripts/tokenizers.js
+index 2db8da33..2b77014d 100644
+--- a/public/scripts/tokenizers.js
++++ b/public/scripts/tokenizers.js
+@@ -1,4 +1,5 @@
+ import { localforage } from '../lib.js';
++import { ChatTokenCache } from './util/chat-token-cache.js';
+ import { characters, event_types, eventSource, main_api, nai_settings, online_status, this_chid } from '../script.js';
+ import { power_user, registerDebugFunction } from './power-user.js';
+ import { chat_completion_sources, model_list, oai_settings } from './openai.js';
+@@ -156,7 +157,7 @@ const TOKENIZER_URLS = {
+ const textEncoder = new TextEncoder();
+ const objectStore = localforage.createInstance({ name: 'SillyTavern_ChatCompletions' });
+ 
+-let tokenCache = {};
++const tokenCache = new ChatTokenCache(objectStore, { onError: (...args) => console.warn('Chat Completions:', ...args) });
+ 
+ /**
+  * Guesstimates the token count for a string.
+@@ -168,30 +169,13 @@ export function guesstimate(str) {
+     return Math.ceil(byteLength / BYTES_PER_TOKEN);
+ }
+ 
+-async function loadTokenCache() {
+-    try {
+-        console.debug('Chat Completions: loading token cache');
+-        tokenCache = await objectStore.getItem('tokenCache') || {};
+-    } catch (e) {
+-        console.log('Chat Completions: unable to load token cache, using default value', e);
+-        tokenCache = {};
+-    }
+-}
+-
+ export async function saveTokenCache() {
+-    try {
+-        console.debug('Chat Completions: saving token cache');
+-        await objectStore.setItem('tokenCache', tokenCache);
+-    } catch (e) {
+-        console.log('Chat Completions: unable to save token cache', e);
+-    }
++    await tokenCache.save();
+ }
+ 
+ async function resetTokenCache() {
+     try {
+-        console.debug('Chat Completions: resetting token cache');
+-        Object.keys(tokenCache).forEach(key => delete tokenCache[key]);
+-        await objectStore.removeItem('tokenCache');
++        await tokenCache.reset();
+         toastr.success('Token cache cleared. Please reload the chat to re-tokenize it.');
+     } catch (e) {
+         console.log('Chat Completions: unable to reset token cache', e);
+@@ -407,9 +391,10 @@ function callTokenizer(type, str) {
+  * Calls the underlying tokenizer model to the token count for a string.
+  * @param {number} type Tokenizer type.
+  * @param {string} str String to tokenize.
++ * @param {object} [remoteParams] Connection settings captured before an asynchronous cache read.
+  * @returns {Promise<number>} Token count.
+  */
+-function callTokenizerAsync(type, str) {
++function callTokenizerAsync(type, str, remoteParams) {
+     return new Promise(resolve => {
+         if (type === tokenizers.NONE) {
+             return resolve(guesstimate(str));
+@@ -419,9 +404,9 @@ function callTokenizerAsync(type, str) {
+             case tokenizers.API_CURRENT:
+                 return callTokenizerAsync(currentRemoteTokenizerAPI(), str).then(resolve);
+             case tokenizers.API_KOBOLD:
+-                return countTokensFromKoboldAPI(str, resolve);
++                return countTokensFromKoboldAPI(str, resolve, remoteParams);
+             case tokenizers.API_TEXTGENERATIONWEBUI:
+-                return countTokensFromTextgenAPI(str, resolve);
++                return countTokensFromTextgenAPI(str, resolve, remoteParams);
+             default: {
+                 const endpointUrl = TOKENIZER_URLS[type]?.count;
+                 if (!endpointUrl) {
+@@ -470,23 +455,33 @@ export async function getTokenCountAsync(str, padding = undefined) {
+         padding = 0;
+     }
+ 
+-    const cacheObject = getTokenCacheObject();
+-    const hash = getStringHash(str);
+-    const cacheKey = `${tokenizerType}-${hash}${modelHash}+${padding}`;
++    // Capture mutable connection settings before waiting for the chat's disk cache.
++    const requestType = tokenizerType === tokenizers.API_CURRENT ? currentRemoteTokenizerAPI() : tokenizerType;
++    const remoteParams = requestType === tokenizers.API_KOBOLD ? { text: str, url: kai_settings.api_server }
++        : requestType === tokenizers.API_TEXTGENERATIONWEBUI ? getTextgenAPITokenizationParams(str) : undefined;
++    const cacheState = getTokenCacheState();
++    try {
++        await cacheState.ready;
++        const cacheObject = cacheState.values;
++        const hash = getStringHash(str);
++        const cacheKey = `${tokenizerType}-${hash}${modelHash}+${padding}`;
+ 
+-    if (typeof cacheObject[cacheKey] === 'number') {
+-        return cacheObject[cacheKey];
+-    }
++        if (typeof cacheObject[cacheKey] === 'number') {
++            return cacheObject[cacheKey];
++        }
+ 
+-    const result = (await callTokenizerAsync(tokenizerType, str)) + padding;
++        const result = (await callTokenizerAsync(requestType, str, remoteParams)) + padding;
+ 
+-    if (isNaN(result)) {
+-        console.warn('Token count calculation returned NaN');
+-        return 0;
+-    }
++        if (isNaN(result)) {
++            console.warn('Token count calculation returned NaN');
++            return 0;
++        }
+ 
+-    cacheObject[cacheKey] = result;
+-    return result;
++        tokenCache.set(cacheState, cacheKey, result);
++        return result;
++    } finally {
++        tokenCache.release(cacheState);
++    }
+ }
+ 
+ /**
+@@ -526,23 +521,28 @@ export function getTokenCount(str, padding = undefined) {
+         padding = 0;
+     }
+ 
+-    const cacheObject = getTokenCacheObject();
+-    const hash = getStringHash(str);
+-    const cacheKey = `${tokenizerType}-${hash}${modelHash}+${padding}`;
++    const cacheState = getTokenCacheState();
++    try {
++        const cacheObject = cacheState.values;
++        const hash = getStringHash(str);
++        const cacheKey = `${tokenizerType}-${hash}${modelHash}+${padding}`;
+ 
+-    if (typeof cacheObject[cacheKey] === 'number') {
+-        return cacheObject[cacheKey];
+-    }
++        if (typeof cacheObject[cacheKey] === 'number') {
++            return cacheObject[cacheKey];
++        }
+ 
+-    const result = callTokenizer(tokenizerType, str) + padding;
++        const result = callTokenizer(tokenizerType, str) + padding;
+ 
+-    if (isNaN(result)) {
+-        console.warn('Token count calculation returned NaN');
+-        return 0;
+-    }
++        if (isNaN(result)) {
++            console.warn('Token count calculation returned NaN');
++            return 0;
++        }
+ 
+-    cacheObject[cacheKey] = result;
+-    return result;
++        tokenCache.set(cacheState, cacheKey, result);
++        return result;
++    } finally {
++        tokenCache.release(cacheState);
++    }
+ }
+ 
+ /**
+@@ -794,47 +794,51 @@ export function getTokenizerModel() {
+  * @deprecated Use countTokensOpenAIAsync instead.
+  */
+ export function countTokensOpenAI(messages, full = false) {
+-    const tokenizerEndpoint = `/api/tokenizers/openai/count?model=${getTokenizerModel()}`;
+-    const cacheObject = getTokenCacheObject();
+-
+-    if (!Array.isArray(messages)) {
+-        messages = [messages];
+-    }
++    const model = getTokenizerModel();
++    const tokenizerEndpoint = `/api/tokenizers/openai/count?model=${model}`;
++    const cacheState = getTokenCacheState();
++    try {
++        const cacheObject = cacheState.values;
+ 
+-    let token_count = 0;
++        if (!Array.isArray(messages)) {
++            messages = [messages];
++        }
+ 
+-    for (const message of messages) {
+-        const model = getTokenizerModel();
++        let token_count = 0;
+ 
+-        if (model === 'claude') {
+-            full = true;
+-        }
++        for (const message of messages) {
++            if (model === 'claude') {
++                full = true;
++            }
+ 
+-        const hash = getStringHash(JSON.stringify(message));
+-        const cacheKey = `${model}-${hash}`;
+-        const cachedCount = cacheObject[cacheKey];
++            const hash = getStringHash(JSON.stringify(message));
++            const cacheKey = `${model}-${hash}`;
++            const cachedCount = cacheObject[cacheKey];
+ 
+-        if (typeof cachedCount === 'number') {
+-            token_count += cachedCount;
+-        } else {
+-            jQuery.ajax({
+-                async: false,
+-                type: 'POST', //
+-                url: tokenizerEndpoint,
+-                data: JSON.stringify([message]),
+-                dataType: 'json',
+-                contentType: 'application/json',
+-                success: function (data) {
+-                    token_count += Number(data.token_count);
+-                    cacheObject[cacheKey] = Number(data.token_count);
+-                },
+-            });
++            if (typeof cachedCount === 'number') {
++                token_count += cachedCount;
++            } else {
++                jQuery.ajax({
++                    async: false,
++                    type: 'POST', //
++                    url: tokenizerEndpoint,
++                    data: JSON.stringify([message]),
++                    dataType: 'json',
++                    contentType: 'application/json',
++                    success: function (data) {
++                        token_count += Number(data.token_count);
++                        tokenCache.set(cacheState, cacheKey, Number(data.token_count));
++                    },
++                });
++            }
+         }
+-    }
+ 
+-    if (!full) token_count -= 2;
++        if (!full) token_count -= 2;
+ 
+-    return token_count;
++        return token_count;
++    } finally {
++        tokenCache.release(cacheState);
++    }
+ }
+ 
+ /**
+@@ -844,53 +848,58 @@ export function countTokensOpenAI(messages, full = false) {
+  * @returns {Promise<number>} Token count.
+  */
+ export async function countTokensOpenAIAsync(messages, full = false) {
+-    const tokenizerEndpoint = `/api/tokenizers/openai/count?model=${getTokenizerModel()}`;
+-    const cacheObject = getTokenCacheObject();
+-
+-    if (!Array.isArray(messages)) {
+-        messages = [messages];
+-    }
++    const model = getTokenizerModel();
++    const tokenizerEndpoint = `/api/tokenizers/openai/count?model=${model}`;
++    const cacheState = getTokenCacheState();
++    try {
++        await cacheState.ready;
++        const cacheObject = cacheState.values;
+ 
+-    let token_count = 0;
++        if (!Array.isArray(messages)) {
++            messages = [messages];
++        }
+ 
+-    for (const message of messages) {
+-        const model = getTokenizerModel();
++        let token_count = 0;
+ 
+-        if (model === 'claude') {
+-            full = true;
+-        }
++        for (const message of messages) {
++            if (model === 'claude') {
++                full = true;
++            }
+ 
+-        const hash = getStringHash(JSON.stringify(message));
+-        const cacheKey = `${model}-${hash}`;
+-        const cachedCount = cacheObject[cacheKey];
++            const hash = getStringHash(JSON.stringify(message));
++            const cacheKey = `${model}-${hash}`;
++            const cachedCount = cacheObject[cacheKey];
+ 
+-        if (typeof cachedCount === 'number') {
+-            token_count += cachedCount;
+-        } else {
+-            const data = await jQuery.ajax({
+-                async: true,
+-                type: 'POST', //
+-                url: tokenizerEndpoint,
+-                data: JSON.stringify([message]),
+-                dataType: 'json',
+-                contentType: 'application/json',
+-            });
+-
+-            token_count += Number(data.token_count);
+-            cacheObject[cacheKey] = Number(data.token_count);
++            if (typeof cachedCount === 'number') {
++                token_count += cachedCount;
++            } else {
++                const data = await jQuery.ajax({
++                    async: true,
++                    type: 'POST', //
++                    url: tokenizerEndpoint,
++                    data: JSON.stringify([message]),
++                    dataType: 'json',
++                    contentType: 'application/json',
++                });
++
++                token_count += Number(data.token_count);
++                tokenCache.set(cacheState, cacheKey, Number(data.token_count));
++            }
+         }
+-    }
+ 
+-    if (!full) token_count -= 2;
++        if (!full) token_count -= 2;
+ 
+-    return token_count;
++        return token_count;
++    } finally {
++        tokenCache.release(cacheState);
++    }
+ }
+ 
+ /**
+- * Gets the token cache object for the current chat.
+- * @returns {Object} Token cache object for the current chat.
++ * Acquires the current chat cache, keeping it resident until tokenCache.release().
++ * @returns {Object} Leased cache state with values and an asynchronous ready promise.
+  */
+-function getTokenCacheObject() {
++function getTokenCacheState() {
+     let chatId = 'undefined';
+ 
+     try {
+@@ -903,11 +912,7 @@ function getTokenCacheObject() {
+         console.log('No character / group selected. Using default cache item');
+     }
+ 
+-    if (typeof tokenCache[chatId] !== 'object') {
+-        tokenCache[chatId] = {};
+-    }
+-
+-    return tokenCache[String(chatId)];
++    return tokenCache.acquire(chatId);
+ }
+ 
+ /**
+@@ -950,9 +955,10 @@ function countTokensFromServer(endpoint, str, resolve) {
+  * Count tokens using the AI provider's API.
+  * @param {string} str String to tokenize.
+  * @param {function} [resolve] Promise resolve function.
++ * @param {object} [params] Captured remote request payload.
+  * @returns {number} Token count.
+  */
+-function countTokensFromKoboldAPI(str, resolve) {
++function countTokensFromKoboldAPI(str, resolve, params = { text: str, url: kai_settings.api_server }) {
+     const isAsync = typeof resolve === 'function';
+     let tokenCount = 0;
+ 
+@@ -960,10 +966,7 @@ function countTokensFromKoboldAPI(str, resolve) {
+         async: isAsync,
+         type: 'POST',
+         url: TOKENIZER_URLS[tokenizers.API_KOBOLD].count,
+-        data: JSON.stringify({
+-            text: str,
+-            url: kai_settings.api_server,
+-        }),
++        data: JSON.stringify(params),
+         dataType: 'json',
+         contentType: 'application/json',
+         success: function (data) {
+@@ -997,9 +1000,10 @@ function getTextgenAPITokenizationParams(str) {
+  * Count tokens using the AI provider's API.
+  * @param {string} str String to tokenize.
+  * @param {function} [resolve] Promise resolve function.
++ * @param {object} [params] Captured remote request payload.
+  * @returns {number} Token count.
+  */
+-function countTokensFromTextgenAPI(str, resolve) {
++function countTokensFromTextgenAPI(str, resolve, params = getTextgenAPITokenizationParams(str)) {
+     const isAsync = typeof resolve === 'function';
+     let tokenCount = 0;
+ 
+@@ -1007,7 +1011,7 @@ function countTokensFromTextgenAPI(str, resolve) {
+         async: isAsync,
+         type: 'POST',
+         url: TOKENIZER_URLS[tokenizers.API_TEXTGENERATIONWEBUI].count,
+-        data: JSON.stringify(getTextgenAPITokenizationParams(str)),
++        data: JSON.stringify(params),
+         dataType: 'json',
+         contentType: 'application/json',
+         success: function (data) {
+@@ -1237,7 +1241,22 @@ export async function initTokenizers() {
+             sessionStorage.removeItem(TOKENIZER_WARNING_KEY);
+         }
+     });
+-    await loadTokenCache();
++    eventSource.on(event_types.CHAT_CHANGED, async () => {
++        const state = getTokenCacheState();
++        try {
++            await state.ready;
++        } finally {
++            tokenCache.release(state);
++        }
++    });
++    for (const event of [event_types.CHAT_DELETED, event_types.GROUP_CHAT_DELETED]) {
++        eventSource.on(event, chatId => tokenCache.remove(chatId).catch(error => console.warn('Unable to delete token cache', error)));
++    }
++    // Old cached counts can be recomputed. Do not parse all historical chats
++    // merely to migrate a performance cache; remove it after startup is idle.
++    const removeLegacy = () => tokenCache.removeLegacyCache().catch(error => console.warn('Unable to remove legacy token cache', error));
++    if (typeof requestIdleCallback === 'function') requestIdleCallback(removeLegacy, { timeout: 2000 });
++    else setTimeout(removeLegacy, 2000);
+     registerDebugFunction('resetTokenCache', 'Reset token cache', 'Purges the calculated token counts. Use this if you want to force a full re-tokenization of all chats or suspect the token counts are wrong.', resetTokenCache);
+ }
+ 
+diff --git a/public/scripts/util/chat-token-cache.js b/public/scripts/util/chat-token-cache.js
+new file mode 100644
+index 00000000..26db202c
+--- /dev/null
++++ b/public/scripts/util/chat-token-cache.js
+@@ -0,0 +1,141 @@
++// Per-chat persistence inspired by TauriTavern's bootstrap optimization:
++// https://github.com/Darkatse/TauriTavern/blob/edf728b67337eb45c82bbe5a13151d901cd74f4a/docs/CurrentState/BootstrapOptimization.md
++// Storage ordering and leases keep synchronous callers, navigation, and resets safe.
++export const TOKEN_CACHE_PREFIX = 'tokenCache:chat:';
++
++/** A bounded, lazily loaded cache of recomputable token counts. */
++export class ChatTokenCache {
++    #store;
++    #states = new Map();
++    #dirty = new Set();
++    #tail = Promise.resolve();
++    #limit;
++    #onError;
++
++    constructor(store, { limit = 4, onError = console.warn } = {}) {
++        this.#store = store;
++        this.#limit = limit;
++        this.#onError = onError;
++    }
++
++    #enqueue(operation) {
++        const promise = this.#tail.then(operation);
++        this.#tail = promise.catch(() => {});
++        return promise;
++    }
++
++    /** Hold a bucket until release(), including while a tokenizer request is pending. */
++    acquire(chatId) {
++        const id = String(chatId);
++        let state = this.#states.get(id);
++        if (!state) {
++            state = { id, values: Object.create(null), users: 0, valid: true, loaded: false, version: 0, savedVersion: 0, evicting: false, ready: null };
++            this.#states.set(id, state);
++            state.ready = this.#enqueue(async () => {
++                if (!state.valid) return;
++                try {
++                    const saved = await this.#store.getItem(TOKEN_CACHE_PREFIX + id);
++                    if (state.valid && saved && typeof saved === 'object' && !Array.isArray(saved)) {
++                        for (const [key, value] of Object.entries(saved)) {
++                            // A synchronous caller can compute a count before IndexedDB finishes.
++                            if (typeof value === 'number' && !Object.hasOwn(state.values, key)) state.values[key] = value;
++                        }
++                    }
++                } catch (error) {
++                    this.#onError('Unable to load token cache', error);
++                } finally {
++                    state.loaded = true;
++                    this.#prune();
++                }
++            });
++        }
++        this.#states.delete(id);
++        this.#states.set(id, state);
++        state.users++;
++        return state;
++    }
++
++    release(state) {
++        state.users--;
++        this.#prune();
++    }
++
++    set(state, key, value) {
++        if (!state.valid) return;
++        state.values[key] = value;
++        state.version++;
++        this.#dirty.add(state);
++    }
++
++    #saveState(state) {
++        return this.#enqueue(async () => {
++            if (!state.valid || state.version === state.savedVersion) return;
++            const version = state.version;
++            const snapshot = { ...state.values };
++            await this.#store.setItem(TOKEN_CACHE_PREFIX + state.id, snapshot);
++            state.savedVersion = version;
++            if (state.version === version) this.#dirty.delete(state);
++        });
++    }
++
++    /** Save only changed buckets. Writes made during a save remain dirty. */
++    async save() {
++        await Promise.all([...this.#dirty].map(state => this.#saveState(state).catch(error => this.#onError('Unable to save token cache', error))));
++        this.#prune();
++    }
++
++    #prune() {
++        let excess = this.#states.size - this.#limit;
++        for (const state of this.#states.values()) {
++            if (excess <= 0) break;
++            if (state.users || !state.loaded || state.evicting) continue;
++            excess--;
++            state.evicting = true;
++            // Keep the same bucket discoverable until its write completes: A/B/A
++            // navigation must never create two writers for the same storage key.
++            let failed = false;
++            this.#saveState(state).catch(error => {
++                failed = true;
++                this.#onError('Unable to save evicted token cache', error);
++            }).finally(() => {
++                state.evicting = false;
++                if (!state.users && this.#states.get(state.id) === state && this.#states.size > this.#limit
++                    && (failed || state.version === state.savedVersion)) {
++                    state.valid = false;
++                    this.#states.delete(state.id);
++                    this.#dirty.delete(state);
++                }
++                this.#prune();
++            });
++        }
++    }
++
++    /** Invalidate consumers immediately, then remove storage after older writes. */
++    async remove(chatId) {
++        const id = String(chatId);
++        const state = this.#states.get(id);
++        if (state) {
++            state.valid = false;
++            this.#states.delete(id);
++            this.#dirty.delete(state);
++        }
++        await this.#enqueue(() => this.#store.removeItem(TOKEN_CACHE_PREFIX + id));
++    }
++
++    async reset() {
++        for (const state of this.#states.values()) state.valid = false;
++        this.#states.clear();
++        this.#dirty.clear();
++        await this.#enqueue(async () => {
++            const keys = await this.#store.keys();
++            for (const key of keys) {
++                if (key === 'tokenCache' || key.startsWith(TOKEN_CACHE_PREFIX)) await this.#store.removeItem(key);
++            }
++        });
++    }
++
++    /** The old monolithic cache is disposable; never deserialize it at startup. */
++    async removeLegacyCache() {
++        await this.#enqueue(() => this.#store.removeItem('tokenCache'));
++    }
++}
+diff --git a/tests/bench-token-cache.mjs b/tests/bench-token-cache.mjs
+new file mode 100644
+index 00000000..2cb3a695
+--- /dev/null
++++ b/tests/bench-token-cache.mjs
+@@ -0,0 +1,77 @@
++// Isolated Chromium + real IndexedDB comparison. No application/user storage is touched.
++import assert from 'node:assert/strict';
++import fs from 'node:fs/promises';
++import { chromium } from '@playwright/test';
++
++const chats = Number(process.env.BENCHMARK_CHATS || 500);
++const counts = Number(process.env.BENCHMARK_COUNTS || 1000);
++const rounds = Number(process.env.BENCHMARK_ROUNDS || 7);
++assert.ok([chats, counts, rounds].every(x => Number.isSafeInteger(x) && x > 0));
++const browser = await chromium.launch({ headless: true });
++try {
++    const page = await browser.newPage({ baseURL: process.env.ST_BASE_URL || 'http://127.0.0.1:18349' });
++    await page.route('**/token-cache-benchmark', route => route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Isolated cache benchmark</title>' }));
++    await page.goto('/token-cache-benchmark');
++    const report = await page.evaluate(async ({ chats, counts, rounds }) => {
++        const { localforage } = await import('/lib.js');
++        const { ChatTokenCache, TOKEN_CACHE_PREFIX } = await import('/scripts/util/chat-token-cache.js');
++        const store = localforage.createInstance({ name: 'SillyTavern_TokenCache_Benchmark' });
++        const legacy = Object.create(null);
++        for (let chat = 0; chat < chats; chat++) {
++            const values = Object.fromEntries(Array.from({ length: counts }, (_, token) => [`1-${chat * counts + token}+0`, token]));
++            legacy[`chat-${chat}`] = values;
++            await store.setItem(TOKEN_CACHE_PREFIX + `chat-${chat}`, values);
++        }
++        await store.setItem('tokenCache', legacy);
++        const wholeJsonBytes = new TextEncoder().encode(JSON.stringify(legacy)).length;
++        const chatJsonBytes = new TextEncoder().encode(JSON.stringify(legacy['chat-0'])).length;
++        const samples = [];
++        try {
++            for (let round = 0; round < rounds; round++) {
++                for (const mode of round % 2 ? ['partitioned', 'monolithic'] : ['monolithic', 'partitioned']) {
++                    const start = performance.now();
++                    let loaded;
++                    let cache;
++                    let state;
++                    if (mode === 'monolithic') loaded = await store.getItem('tokenCache');
++                    else {
++                        cache = new ChatTokenCache(store);
++                        state = cache.acquire('chat-0');
++                        await state.ready;
++                        loaded = state.values;
++                    }
++                    const loadMs = performance.now() - start;
++                    const valueCount = mode === 'monolithic' ? Object.values(loaded).reduce((sum, bucket) => sum + Object.keys(bucket).length, 0) : Object.keys(loaded).length;
++                    if (valueCount !== (mode === 'monolithic' ? chats * counts : counts)) throw new Error('Wrong loaded count');
++                    const writeStart = performance.now();
++                    if (mode === 'monolithic') {
++                        loaded['chat-0']['1-0+0'] = round;
++                        await store.setItem('tokenCache', loaded);
++                    } else {
++                        cache.set(state, '1-0+0', round);
++                        await cache.save();
++                        cache.release(state);
++                    }
++                    const saveMs = performance.now() - writeStart;
++                    samples.push({ round, mode, loadMs, saveMs, loadedCounts: valueCount });
++                }
++            }
++            const old = await store.getItem('tokenCache');
++            const current = await store.getItem(TOKEN_CACHE_PREFIX + 'chat-0');
++            if (JSON.stringify(old['chat-0']) !== JSON.stringify(current)) throw new Error('Final active-chat counts differ');
++            const median = values => values.sort((a, b) => a - b)[Math.floor(values.length / 2)];
++            const summary = Object.fromEntries(['monolithic', 'partitioned'].map(mode => [mode, {
++                loadMs: median(samples.filter(x => x.mode === mode).map(x => x.loadMs)),
++                saveMs: median(samples.filter(x => x.mode === mode).map(x => x.saveMs)),
++            }]));
++            return { chats, counts, rounds, wholeJsonBytes, chatJsonBytes, summary, samples, scope: 'Real Chromium IndexedDB read/write of cached counts. Fixture setup excluded; storage/OS caches are warm. No claim about provider latency or entire application startup.' };
++        } finally {
++            await store.dropInstance();
++        }
++    }, { chats, counts, rounds });
++    const output = process.env.BENCHMARK_OUTPUT || '/tmp/csilly-token-cache-benchmark.json';
++    await fs.writeFile(output, JSON.stringify(report, null, 2));
++    console.log(JSON.stringify({ ...report, samples: undefined }, null, 2));
++} finally {
++    await browser.close();
++}
+diff --git a/tests/chat-token-cache.node.mjs b/tests/chat-token-cache.node.mjs
+new file mode 100644
+index 00000000..0397d3cc
+--- /dev/null
++++ b/tests/chat-token-cache.node.mjs
+@@ -0,0 +1,209 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { ChatTokenCache, TOKEN_CACHE_PREFIX } from '../public/scripts/util/chat-token-cache.js';
++
++const tick = () => new Promise(resolve => setImmediate(resolve));
++function deferred() {
++    let resolve;
++    const promise = new Promise(done => { resolve = done; });
++    return { promise, resolve };
++}
++function fixture(initial = {}, options = {}) {
++    const data = new Map(Object.entries(initial));
++    const calls = [];
++    const errors = [];
++    const store = {
++        async getItem(key) { calls.push(['get', key]); return structuredClone(data.get(key)); },
++        async setItem(key, value) { calls.push(['set', key, structuredClone(value)]); data.set(key, structuredClone(value)); },
++        async removeItem(key) { calls.push(['remove', key]); data.delete(key); },
++        async keys() { calls.push(['keys']); return [...data.keys()]; },
++    };
++    const cache = new ChatTokenCache(store, { ...options, onError: (...args) => errors.push(args) });
++    return { data, calls, store, cache, errors };
++}
++
++test('loads only requested chats and saves only dirty buckets, preserving zero counts and unusual IDs', async () => {
++    const { cache, calls, data } = fixture({ tokenCache: { giant: 'legacy' }, [TOKEN_CACHE_PREFIX + '__proto__']: { zero: 0, bad: 'not a count' } });
++    assert.deepEqual(calls, []);
++    const a = cache.acquire('__proto__');
++    await a.ready;
++    assert.equal(a.values.zero, 0);
++    assert.equal(a.values.bad, undefined);
++    await cache.save();
++    assert.deepEqual(calls, [['get', TOKEN_CACHE_PREFIX + '__proto__']]);
++    cache.set(a, 'x', 12);
++    await cache.save();
++    await cache.save();
++    assert.deepEqual(data.get(TOKEN_CACHE_PREFIX + '__proto__'), { zero: 0, x: 12 });
++    assert.equal(calls.filter(x => x[0] === 'set').length, 1);
++    cache.release(a);
++});
++
++test('disk load merges without replacing counts computed synchronously while it was pending', async () => {
++    const { cache, store } = fixture();
++    const gate = deferred();
++    store.getItem = () => gate.promise;
++    const a = cache.acquire('a');
++    cache.set(a, 'fresh', 9);
++    gate.resolve({ fresh: 1, diskOnly: 3 });
++    await a.ready;
++    assert.deepEqual({ ...a.values }, { fresh: 9, diskOnly: 3 });
++    cache.release(a);
++});
++
++test('mutations during a pending write remain dirty and are saved by the next flush', async () => {
++    const { cache, store, data } = fixture();
++    const a = cache.acquire('a');
++    await a.ready;
++    const started = deferred();
++    const gate = deferred();
++    const write = store.setItem;
++    store.setItem = async (key, value) => { started.resolve(); await gate.promise; await write(key, value); };
++    cache.set(a, 'first', 1);
++    const saving = cache.save();
++    await started.promise;
++    cache.set(a, 'later', 2);
++    gate.resolve();
++    await saving;
++    assert.deepEqual(data.get(TOKEN_CACHE_PREFIX + 'a'), { first: 1 });
++    await cache.save();
++    assert.deepEqual(data.get(TOKEN_CACHE_PREFIX + 'a'), { first: 1, later: 2 });
++    cache.release(a);
++});
++
++test('leases preserve an in-flight chat across navigation, then evicted buckets reload from disk', async () => {
++    const { cache, calls, data } = fixture({}, { limit: 1 });
++    const a = cache.acquire('a');
++    await a.ready;
++    const b = cache.acquire('b');
++    await b.ready;
++    cache.set(b, 'b', 2);
++    cache.release(b);
++    await tick();
++    cache.set(a, 'late', 1);
++    await cache.save();
++    cache.release(a);
++    assert.deepEqual(data.get(TOKEN_CACHE_PREFIX + 'a'), { late: 1 });
++    assert.deepEqual(data.get(TOKEN_CACHE_PREFIX + 'b'), { b: 2 });
++    const b2 = cache.acquire('b');
++    await b2.ready;
++    assert.equal(b2.values.b, 2);
++    assert.equal(calls.filter(x => x[0] === 'get' && x[1] === TOKEN_CACHE_PREFIX + 'b').length, 2);
++    cache.release(b2);
++});
++
++test('A/B/A navigation during eviction reuses the writer and does not lose new counts', async () => {
++    const { cache, store, data } = fixture({}, { limit: 1 });
++    const a = cache.acquire('a');
++    await a.ready;
++    cache.set(a, 'old', 1);
++    cache.release(a);
++    const started = deferred();
++    const gate = deferred();
++    const write = store.setItem;
++    store.setItem = async (key, value) => { started.resolve(); await gate.promise; await write(key, value); };
++    const b = cache.acquire('b');
++    await b.ready;
++    cache.release(b);
++    await started.promise;
++    const again = cache.acquire('a');
++    assert.equal(again, a);
++    cache.set(again, 'new', 2);
++    cache.release(again);
++    gate.resolve();
++    await tick();
++    assert.deepEqual(data.get(TOKEN_CACHE_PREFIX + 'a'), { old: 1, new: 2 }, 'Eviction automatically flushes updates made during its first write');
++});
++
++for (const action of ['remove', 'reset']) {
++    test(`${action} waits for older writes and rejects stale in-flight results without deleting other data`, async () => {
++        const { cache, store, data } = fixture({ unrelated: { keep: true }, tokenCache: { legacy: true } });
++        const a = cache.acquire('a');
++        await a.ready;
++        cache.set(a, 'old', 1);
++        const started = deferred();
++        const gate = deferred();
++        const write = store.setItem;
++        store.setItem = async (key, value) => { started.resolve(); await gate.promise; await write(key, value); };
++        const saving = cache.save();
++        await started.promise;
++        const clearing = action === 'reset' ? cache.reset() : cache.remove('a');
++        cache.set(a, 'stale', 7);
++        const next = cache.acquire('a');
++        gate.resolve();
++        await Promise.all([saving, clearing, next.ready]);
++        assert.deepEqual({ ...next.values }, {});
++        assert.equal(data.has(TOKEN_CACHE_PREFIX + 'a'), false);
++        assert.deepEqual(data.get('unrelated'), { keep: true });
++        cache.set(next, 'new', 3);
++        await cache.save();
++        assert.deepEqual(data.get(TOKEN_CACHE_PREFIX + 'a'), { new: 3 });
++        cache.release(a);
++        cache.release(next);
++    });
++}
++
++test('storage failures fall back to fresh counts and allow later saves and resets', async () => {
++    const { cache, store, data, errors } = fixture();
++    store.getItem = async () => { throw new Error('unavailable'); };
++    const a = cache.acquire('a');
++    await a.ready;
++    cache.set(a, 'count', 4);
++    const write = store.setItem;
++    store.setItem = async () => { throw new Error('quota'); };
++    await cache.save();
++    store.setItem = write;
++    await cache.save();
++    assert.deepEqual(data.get(TOKEN_CACHE_PREFIX + 'a'), { count: 4 });
++    assert.equal(errors.length, 2);
++    await cache.reset();
++    cache.release(a);
++});
++
++test('legacy cleanup removes the old blob without reading it or unrelated storage', async () => {
++    const { cache, calls, data } = fixture({ tokenCache: { huge: true }, other: 1 });
++    await cache.removeLegacyCache();
++    assert.deepEqual(calls, [['remove', 'tokenCache']]);
++    assert.deepEqual([...data.entries()], [['other', 1]]);
++});
++
++
++test('visiting many chats retains only the four most recent idle buckets', async () => {
++    const { cache } = fixture();
++    const states = [];
++    for (let i = 0; i < 100; i++) {
++        const state = cache.acquire(`chat-${i}`);
++        await state.ready;
++        cache.set(state, 'count', i);
++        cache.release(state);
++        states.push(state);
++    }
++    await tick();
++    assert.equal(states.filter(state => state.valid).length, 4);
++    for (let i = 96; i < 100; i++) {
++        const recent = cache.acquire(`chat-${i}`);
++        assert.equal(recent, states[i]);
++        cache.release(recent);
++    }
++    const first = cache.acquire('chat-0');
++    await first.ready;
++    assert.notEqual(first, states[0]);
++    assert.equal(first.values.count, 0);
++    cache.release(first);
++});
++
++test('failed eviction writes release recomputable data instead of growing resident history forever', async () => {
++    const { cache, store, errors } = fixture({}, { limit: 1 });
++    store.setItem = async () => { throw new Error('quota'); };
++    const states = [];
++    for (let i = 0; i < 5; i++) {
++        const state = cache.acquire(i);
++        await state.ready;
++        cache.set(state, 'count', i);
++        cache.release(state);
++        states.push(state);
++    }
++    await tick();
++    assert.equal(states.filter(state => state.valid).length, 1);
++    assert.ok(errors.length >= 4);
++});
+diff --git a/tests/frontend/ChatTokenCache.e2e.js b/tests/frontend/ChatTokenCache.e2e.js
+new file mode 100644
+index 00000000..7ef07ec6
+--- /dev/null
++++ b/tests/frontend/ChatTokenCache.e2e.js
+@@ -0,0 +1,155 @@
++import { test, expect } from '@playwright/test';
++import { testSetup } from './frontent-test-utils.js';
++
++test.beforeEach(async ({ page }) => {
++    await page.route('**/api/settings/get', async route => {
++        const response = await route.fetch();
++        const data = await response.json();
++        const settings = JSON.parse(data.settings);
++        settings.firstRun = false;
++        data.settings = JSON.stringify(settings);
++        await route.fulfill({ response, json: data });
++    });
++    await page.route('**/api/settings/save', route => route.fulfill({ json: { result: 'ok' } }));
++    await testSetup.awaitST({ page });
++    await page.locator('#chat .mes[type="welcome_prompt"]').waitFor();
++});
++
++test('tokenizer counts persist per chat and reload after LRU eviction', async ({ page }) => {
++    let calls = 0;
++    await page.route('**/api/tokenizers/gpt2/encode', route => route.fulfill({ json: { count: ++calls } }));
++    const result = await page.evaluate(async () => {
++        const script = await import('/script.js');
++        const { power_user } = await import('/scripts/power-user.js');
++        const { getTokenCountAsync, saveTokenCache, tokenizers } = await import('/scripts/tokenizers.js');
++        const { TOKEN_CACHE_PREFIX } = await import('/scripts/util/chat-token-cache.js');
++        const { localforage } = await import('/lib.js');
++        const store = localforage.createInstance({ name: 'SillyTavern_ChatCompletions' });
++        script.changeMainAPI('kobold');
++        power_user.tokenizer = tokenizers.GPT2;
++        const index = script.characters.length;
++        script.characters.push({ chat: 'partition-0' });
++        script.setCharacterId(index);
++        const counts = [];
++        for (let i = 0; i < 7; i++) {
++            script.characters[index].chat = `partition-${i}`;
++            counts.push(await getTokenCountAsync('same text across separate chats'));
++            await saveTokenCache();
++        }
++        script.characters[index].chat = 'partition-0';
++        const again = await getTokenCountAsync('same text across separate chats');
++        const persisted = await Promise.all(Array.from({ length: 7 }, (_, i) => store.getItem(TOKEN_CACHE_PREFIX + `partition-${i}`)));
++        return { counts, again, persisted: persisted.map(bucket => Object.values(bucket)) };
++    });
++    expect(result.counts).toEqual([1, 2, 3, 4, 5, 6, 7]);
++    expect(result.again).toBe(1);
++    expect(result.persisted).toEqual([[1], [2], [3], [4], [5], [6], [7]]);
++    expect(calls).toBe(7);
++});
++
++test('pending tokenizer results stay with their original chat after navigation', async ({ page }) => {
++    let finishFirst;
++    const firstSeen = new Promise(resolve => { finishFirst = resolve; });
++    let delayedRoute;
++    await page.route('**/api/tokenizers/gpt2/encode', async route => {
++        if (route.request().postDataJSON().text === 'first chat pending') {
++            delayedRoute = route;
++            finishFirst();
++        } else await route.fulfill({ json: { count: 22 } });
++    });
++    await page.evaluate(async () => {
++        const script = await import('/script.js');
++        const { power_user } = await import('/scripts/power-user.js');
++        const tokenizer = await import('/scripts/tokenizers.js');
++        script.changeMainAPI('kobold');
++        power_user.tokenizer = tokenizer.tokenizers.GPT2;
++        const index = script.characters.length;
++        script.characters.push({ chat: 'pending-a' });
++        script.setCharacterId(index);
++        window.pendingTokenCount = tokenizer.getTokenCountAsync('first chat pending');
++    });
++    await firstSeen;
++    const second = await page.evaluate(async () => {
++        const script = await import('/script.js');
++        script.characters[script.this_chid].chat = 'pending-b';
++        return (await import('/scripts/tokenizers.js')).getTokenCountAsync('second chat immediate');
++    });
++    await delayedRoute.fulfill({ json: { count: 11 } });
++    const stored = await page.evaluate(async () => {
++        const first = await window.pendingTokenCount;
++        await (await import('/scripts/tokenizers.js')).saveTokenCache();
++        const { TOKEN_CACHE_PREFIX } = await import('/scripts/util/chat-token-cache.js');
++        const { localforage } = await import('/lib.js');
++        const store = localforage.createInstance({ name: 'SillyTavern_ChatCompletions' });
++        return { first, a: Object.values(await store.getItem(TOKEN_CACHE_PREFIX + 'pending-a')), b: Object.values(await store.getItem(TOKEN_CACHE_PREFIX + 'pending-b')) };
++    });
++    expect(second).toBe(22);
++    expect(stored).toEqual({ first: 11, a: [11], b: [22] });
++});
++
++test('startup never deserializes the monolithic legacy cache and eventually removes it', async ({ page }) => {
++    await page.evaluate(async () => {
++        const { localforage } = await import('/lib.js');
++        const store = localforage.createInstance({ name: 'SillyTavern_ChatCompletions' });
++        await store.setItem('tokenCache', { legacyChat: { count: 123 } });
++        await store.setItem('unrelated-cache', { keep: true });
++    });
++    await page.addInitScript(() => {
++        window.legacyCacheReads = 0;
++        const get = IDBObjectStore.prototype.get;
++        IDBObjectStore.prototype.get = function (key) {
++            if (key === 'tokenCache') window.legacyCacheReads++;
++            return get.call(this, key);
++        };
++    });
++    await testSetup.awaitST({ page });
++    const result = await page.evaluate(async () => {
++        const reads = window.legacyCacheReads;
++        const { localforage } = await import('/lib.js');
++        const store = localforage.createInstance({ name: 'SillyTavern_ChatCompletions' });
++        return { reads, unrelated: await store.getItem('unrelated-cache') };
++    });
++    expect(result).toEqual({ reads: 0, unrelated: { keep: true } });
++    await expect.poll(() => page.evaluate(async () => {
++        const { localforage } = await import('/lib.js');
++        return localforage.createInstance({ name: 'SillyTavern_ChatCompletions' }).getItem('tokenCache');
++    })).toBeNull();
++});
++
++test('cache loading cannot switch the model or remote server of an already requested count', async ({ page }) => {
++    const requests = [];
++    await page.route('**/api/tokenizers/**', route => {
++        requests.push({ path: new URL(route.request().url()).pathname, model: new URL(route.request().url()).searchParams.get('model'), payload: route.request().postDataJSON() });
++        return route.fulfill({ json: { count: 17, token_count: 17 } });
++    });
++    const result = await page.evaluate(async () => {
++        const script = await import('/script.js');
++        const { power_user } = await import('/scripts/power-user.js');
++        const { oai_settings, chat_completion_sources } = await import('/scripts/openai.js');
++        const { kai_settings } = await import('/scripts/kai-settings.js');
++        const { getTokenCountAsync, countTokensOpenAIAsync, saveTokenCache, tokenizers } = await import('/scripts/tokenizers.js');
++        const { localforage } = await import('/lib.js');
++        const { TOKEN_CACHE_PREFIX } = await import('/scripts/util/chat-token-cache.js');
++        const index = script.characters.length;
++        script.characters.push({ chat: 'connection-capture' });
++        script.setCharacterId(index);
++        oai_settings.chat_completion_source = chat_completion_sources.OPENAI;
++        oai_settings.openai_model = 'model-before-cache-load';
++        const openai = countTokensOpenAIAsync([{ content: 'first' }, { content: 'second' }], true);
++        oai_settings.openai_model = 'model-after-cache-load';
++        script.changeMainAPI('kobold');
++        power_user.tokenizer = tokenizers.API_CURRENT;
++        kai_settings.api_server = 'http://before-cache-load.invalid';
++        const remote = getTokenCountAsync('captured remote');
++        kai_settings.api_server = 'http://after-cache-load.invalid';
++        const values = await Promise.all([openai, remote]);
++        await saveTokenCache();
++        const stored = await localforage.createInstance({ name: 'SillyTavern_ChatCompletions' }).getItem(TOKEN_CACHE_PREFIX + 'connection-capture');
++        return { values, keys: Object.keys(stored) };
++    });
++    expect(result.values).toEqual([34, 17]);
++    expect(requests.filter(x => x.path === '/api/tokenizers/openai/count').map(x => x.model)).toEqual(['model-before-cache-load', 'model-before-cache-load']);
++    expect(requests.find(x => x.path === '/api/tokenizers/remote/kobold/count').payload).toEqual({ text: 'captured remote', url: 'http://before-cache-load.invalid' });
++    expect(result.keys.filter(key => key.startsWith('model-before-cache-load-'))).toHaveLength(2);
++    expect(result.keys.some(key => key.startsWith('model-after-cache-load-'))).toBe(false);
++});

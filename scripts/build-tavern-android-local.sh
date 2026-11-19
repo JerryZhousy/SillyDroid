@@ -15,6 +15,8 @@ workspace_root="$(cd "$script_dir/.." && pwd)"
 runtime_rid='linux-arm64'
 requested_tag='auto'
 requested_build_type='auto'
+requested_patch_set=''
+patch_disabled='false'
 
 usage() {
     cat <<'EOF'
@@ -29,6 +31,8 @@ usage() {
   --tavern-tag <tag>     指定上游 SillyTavern tag；默认 auto
   --build-type <type>    指定 APK 构建类型：debug 或 release；默认 auto
   --runtime-rid <rid>    指定运行时 RID；默认 linux-arm64
+  --patch-set <id>       覆盖 sillydroid-build-config.json 里的源码补丁集 setId
+  --no-patches           本次构建跳过源码补丁集，按纯净上游源码打包
   -h, --help             显示帮助
 EOF
 }
@@ -46,6 +50,13 @@ while [ "$#" -gt 0 ]; do
         --runtime-rid)
             shift
             runtime_rid="${1:-}"
+            ;;
+        --patch-set)
+            shift
+            requested_patch_set="${1:-}"
+            ;;
+        --no-patches)
+            patch_disabled='true'
             ;;
         -h|--help)
             usage
@@ -129,6 +140,8 @@ printf 'tavern_tag=%s\n' "$tavern_tag"
 printf 'build_type=%s\n' "$build_type"
 printf 'host_version=%s\n' "$host_version"
 printf 'artifact_name=%s\n' "$artifact_name"
+printf 'patch_set=%s\n' "$(get_plan_value patch_set_id)"
+printf 'patch_applies=%s\n' "$(get_plan_value patch_applies)"
 printf 'rootfs_dir=%s\n' "$rootfs_dir"
 printf 'dependency_dir=%s\n' "$dependency_dir"
 printf 'server_dir=%s\n' "$server_dir"
@@ -147,10 +160,14 @@ bash "$workspace_root/scripts/build-tavern-dependency-packs.sh" \
     --target-root "$dependency_dir"
 
 printf '\n==> stage 3/4 server source\n'
-bash "$workspace_root/scripts/sync-tavern-android-bootstrap.sh" \
-    --runtime-rid "$runtime_rid" \
-    --tag "$tavern_tag" \
-    --target-root "$server_dir"
+stage3_args=(--runtime-rid "$runtime_rid" --tag "$tavern_tag" --target-root "$server_dir")
+if [[ -n "$requested_patch_set" ]]; then
+    stage3_args+=(--patch-set "$requested_patch_set")
+fi
+if [[ "$patch_disabled" == 'true' ]]; then
+    stage3_args+=(--no-patches)
+fi
+bash "$workspace_root/scripts/sync-tavern-android-bootstrap.sh" "${stage3_args[@]}"
 
 printf '\n==> stage 4/4 apk\n'
 export SILLYDROID_ANDROID_HOST_VERSION="$host_version"

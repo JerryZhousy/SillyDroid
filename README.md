@@ -8,7 +8,7 @@
 
 这个仓库维护 SillyDroid Android 宿主、离线运行时打包链，以及基于指定 SillyTavern tag 的 APK 构建与发布流程。
 
-上游 SillyTavern 源码不会长期作为主工程保存在仓库里；构建时会同步指定 tag，先生成 stage 3 的不可变 server source（源码与 npm 运行依赖），再由 stage 4 把该包、dependency packs、宿主脚本和 patch assets 分别写入 APK assets。Stage 3 只受上游 Tavern tag 与上游 npm lockfile 控制，不承载宿主启动脚本、runtime patch 或 Android 侧启动策略。
+上游 SillyTavern 源码不会长期作为主工程保存在仓库里；构建时会同步指定 tag，先生成 stage 3 的不可变 server source（源码与 npm 运行依赖），再由 stage 4 把该包、dependency packs、宿主脚本和 patch assets 分别写入 APK assets。Stage 3 只受上游 Tavern tag、`patches/tavern/<tag>` 源码补丁集与上游 npm lockfile 控制，不承载宿主启动脚本、runtime patch 或 Android 侧启动策略。
 
 README 保留常用说明；更细的构建语义、阶段边界和脚本职责，以 scripts 下对应脚本开头的 Contract 注释为准。
 
@@ -100,11 +100,37 @@ curl -fsSL https://raw.githubusercontent.com/jialmaster/SillyDroid/master/script
 6. `scripts/build-tavern-dependency-packs.sh`
    单独构建 `node`、`git` 等 dependency pack zip。
 7. `scripts/sync-tavern-android-bootstrap.sh`
-   下载指定 SillyTavern tag，安装 npm 运行依赖并生成 `server-source.zip`；不包含宿主启动脚本、runtime patch、dependency packs，也不直接产出 APK server assets。
+   下载指定 SillyTavern tag，按 `patches/tavern/<tag>` 应用源码补丁集，安装 npm 运行依赖并生成 `server-source.zip`；不包含宿主启动脚本、runtime patch、dependency packs，也不直接产出 APK server assets。
 8. `scripts/build-tavern-android-apk.sh`
    当前是阶段 4 脚本，只消费现有 runtime image、server source、dependency packs 组装 debug 或 release APK；不会重新安装 server source 的 npm 运行依赖。
 9. `scripts/android-build-common.sh`
    Android/WSL 构建公共环境脚本。
+10. `scripts/export-tavern-upstream-patches.sh`
+    开发期工具，把上游 fork 的修复重放到指定 tag 上并导出 `patches/tavern/<tag>` 补丁集，不参与 stage 1-4。
+
+## 源码补丁集
+
+stage 3 支持在解压上游 tag 之后、`npm ci` 之前应用一层源码补丁，用于把上游尚未合并的修复带进 APK。补丁集由 `sillydroid-build-config.json` 的 `build.tavernSourcePatches` 控制：
+
+- `enabled`：总开关；设为 `false` 时按纯净上游源码打包。
+- `setId`：补丁集标识，会写进 `server-source-manifest.json` 的 `patches.setId`，用于区分打过补丁与纯净的 server source。
+- `baseTag`：补丁集对应的上游 tag；与本次构建 tag 不一致时自动跳过（不会把旧补丁糊到新版本上）。
+- `path`：补丁目录，默认 `patches/tavern/<baseTag>`。
+- `required`：为 `true` 时，补丁集「该应用但应用失败」会直接中断构建，避免以为打了补丁其实没打。
+
+当前补丁集 `patches/tavern/1.19.0` 来自 `shalistera/sillytavern`，共 31 个提交（性能优化、渲染与流式修复、原生 Vertex 流式与自定义模型 ID）。
+
+重新生成补丁集：
+
+```bash
+bash ./scripts/export-tavern-upstream-patches.sh --base-tag 1.19.0
+```
+
+上游发布新 tag 后，把 `baseTag` / `path` 指向新的补丁集目录即可；补丁集更新会通过 `patches/` 变更自动让已发布的 server source 失效重建。临时构建纯净版可用 `--no-patches`：
+
+```bash
+bash ./scripts/build-tavern-android-local.sh --tavern-tag 1.19.0 --no-patches
+```
 
 ## 前置要求
 

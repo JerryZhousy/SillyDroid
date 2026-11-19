@@ -1,0 +1,844 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shalistera <119715343+Shalistera@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 20:24:15 +0900
+Subject: [PATCH 03/31] Optimize reasoning Markdown, world info scans, and chat
+ search
+
+---
+ public/script.js                      |   9 +-
+ public/scripts/reasoning.js           |   7 +-
+ public/scripts/util/markdown-cache.js |  90 +++++++++++
+ public/scripts/world-info.js          |  74 ++++++++-
+ src/endpoints/chats.js                |  38 ++++-
+ tests/chat-search.node.mjs            |  99 ++++++++++++
+ tests/markdown-cache.node.mjs         |  92 ++++++++++++
+ tests/native-scan-render.node.mjs     | 208 ++++++++++++++++++++++++++
+ 8 files changed, 603 insertions(+), 14 deletions(-)
+ create mode 100644 public/scripts/util/markdown-cache.js
+ create mode 100644 tests/chat-search.node.mjs
+ create mode 100644 tests/markdown-cache.node.mjs
+ create mode 100644 tests/native-scan-render.node.mjs
+
+diff --git a/public/script.js b/public/script.js
+index b50ff658..e3c5c7e7 100644
+--- a/public/script.js
++++ b/public/script.js
+@@ -284,6 +284,7 @@ import { SimpleMutex } from './scripts/util/SimpleMutex.js';
+ import { AudioPlayer } from './scripts/audio-player.js';
+ import { MacroEnvBuilder } from './scripts/macros/engine/MacroEnvBuilder.js';
+ import { MessageFormatter } from './scripts/message-formatter.js';
++import { trackMarkdownConverter } from './scripts/util/markdown-cache.js';
+ import { MacroEngine } from './scripts/macros/engine/MacroEngine.js';
+ import { addChatBackupsBrowser } from './scripts/chat-backups.js';
+ import { onboardingExperimentalMacroEngine } from './scripts/macros/engine/MacroDiagnostics.js';
+@@ -535,6 +536,7 @@ export function reloadMarkdownProcessor() {
+     // Inject the dinkus extension after creating the converter
+     // Maybe move this into power_user init?
+     converter.addExtension(markdownExclusionExt(), 'exclusion');
++    trackMarkdownConverter(converter);
+ 
+     return converter;
+ }
+@@ -1796,9 +1798,10 @@ export async function sendTextareaMessage() {
+  *   overrides. Merged on top of the default config.
+  * @param {boolean} [isReasoning=false] - Whether the message is reasoning/thinking
+  *   output (affects regex placement and some display rules).
++ * @param {import('./scripts/util/markdown-cache.js').MarkdownRenderCache} [markdownCache] - Optional per-handler Markdown cache.
+  * @returns {string} Sanitized HTML string ready to assign to `innerHTML`.
+  */
+-export function messageFormatting(mes, ch_name, isSystem, isUser, messageId, sanitizerOverrides = {}, isReasoning = false) {
++export function messageFormatting(mes, ch_name, isSystem, isUser, messageId, sanitizerOverrides = {}, isReasoning = false, markdownCache = null) {
+     if (!mes) {
+         return '';
+     }
+@@ -1931,7 +1934,9 @@ export function messageFormatting(mes, ch_name, isSystem, isUser, messageId, san
+ 
+         mes = mes.replaceAll('\\begin{align*}', '$$');
+         mes = mes.replaceAll('\\end{align*}', '$$');
+-        mes = converter.makeHtml(mes);
++        mes = markdownCache
++            ? markdownCache.render(mes, converter, !power_user.markdown_escape_strings)
++            : converter.makeHtml(mes);
+ 
+         mes = mes.replace(/<code(.*)>[\s\S]*?<\/code>/g, function (match) {
+             // Firefox creates extra newlines from <br>s in code blocks, so we replace them before converting newlines to <br>s.
+diff --git a/public/scripts/reasoning.js b/public/scripts/reasoning.js
+index 1eb4f367..86551428 100644
+--- a/public/scripts/reasoning.js
++++ b/public/scripts/reasoning.js
+@@ -16,6 +16,7 @@ import { enumTypes, SlashCommandEnumValue } from './slash-commands/SlashCommandE
+ import { SlashCommandParser } from './slash-commands/SlashCommandParser.js';
+ import { textgen_types, textgenerationwebui_settings } from './textgen-settings.js';
+ import { createStreamingContentUpdater } from './util/stream-fadein.js';
++import { MarkdownRenderCache } from './util/markdown-cache.js';
+ import { copyText, escapeRegex, isFalseBoolean, isTrueBoolean, setDatasetProperty, stringToRange, trimSpaces } from './utils.js';
+ 
+ /**
+@@ -275,6 +276,7 @@ export const ReasoningState = {
+  */
+ export class ReasoningHandler {
+     #updateStreamingContent = createStreamingContentUpdater();
++    #markdownCache = new MarkdownRenderCache();
+ 
+     /** @type {boolean} True if the model supports reasoning, but hides the reasoning output */
+     #isHiddenReasoningModel;
+@@ -565,6 +567,9 @@ export class ReasoningHandler {
+      */
+     updateDom(messageId, { force = false } = {}) {
+         this.#checkDomElements(messageId);
++        if (force) {
++            this.#markdownCache.clear();
++        }
+ 
+         // Main CSS class to show this message includes reasoning
+         this.messageDom.classList.toggle('reasoning', this.state !== ReasoningState.None);
+@@ -581,7 +586,7 @@ export class ReasoningHandler {
+         const hasStoredReasoning = Boolean(this.reasoningDisplayText || this.reasoning);
+         const hasReasoningContent = Boolean(String(rawReasoning ?? '').trim());
+         setDatasetProperty(this.messageReasoningDetailsDom, 'hasContent', hasReasoningContent ? 'true' : null);
+-        const displayReasoning = messageFormatting(reasoning, '', false, false, messageId, {}, true);
++        const displayReasoning = messageFormatting(reasoning, '', false, false, messageId, {}, true, this.#markdownCache);
+ 
+         this.#updateStreamingContent(this.messageReasoningContentDom, displayReasoning, power_user.stream_fade_in, force);
+ 
+diff --git a/public/scripts/util/markdown-cache.js b/public/scripts/util/markdown-cache.js
+new file mode 100644
+index 00000000..0908bc6d
+--- /dev/null
++++ b/public/scripts/util/markdown-cache.js
+@@ -0,0 +1,90 @@
++/** @type {WeakMap<object, object>} Native converter configurations eligible for memoization. */
++const nativeConverters = new WeakMap();
++
++/**
++ * Records a freshly configured native converter. Custom Showdown listeners may
++ * depend on external state, so registering one disables caching for this instance.
++ * @param {import('showdown').Converter} converter Markdown converter
++ */
++export function trackMarkdownConverter(converter) {
++    const extensions = converter.getAllExtensions();
++    const profile = {
++        makeHtml: converter.makeHtml,
++        dispatch: converter._dispatch,
++        extensions: Object.fromEntries(Object.entries(extensions).map(([type, entries]) =>
++            [type, entries.map(entry => ({ ...entry }))],
++        )),
++        hasListeners: false,
++    };
++    nativeConverters.set(converter, profile);
++    const listen = converter.listen;
++    converter.listen = function (...args) {
++        profile.hasListeners = true;
++        return listen.apply(this, args);
++    };
++}
++
++/**
++ * Checks that only the recorded native extensions are installed and unchanged.
++ * @param {import('showdown').Converter} converter Markdown converter
++ * @returns {boolean} Whether conversion is eligible for caching
++ */
++function isNativeConverter(converter) {
++    const profile = nativeConverters.get(converter);
++    if (!profile || profile.hasListeners || converter.makeHtml !== profile.makeHtml || converter._dispatch !== profile.dispatch) {
++        return false;
++    }
++    const extensions = converter.getAllExtensions();
++    return Object.keys(extensions).length === Object.keys(profile.extensions).length
++        && Object.entries(profile.extensions).every(([type, entries]) =>
++            extensions[type]?.length === entries.length && entries.every((entry, index) => {
++                const current = extensions[type][index];
++                return Object.keys(current).length === Object.keys(entry).length
++                    && Object.entries(entry).every(([key, value]) => current[key] === value);
++            }),
++        );
++}
++
++/**
++ * One-result cache owned by a reasoning handler. Regexes, formatter hooks and
++ * sanitization stay outside this cache and continue to run on every update.
++ */
++export class MarkdownRenderCache {
++    #converter;
++    #options;
++    #text;
++    #html;
++
++    /** Discards the previous conversion, including before a forced final render. */
++    clear() {
++        this.#converter = undefined;
++        this.#options = undefined;
++        this.#text = undefined;
++        this.#html = undefined;
++    }
++
++    /**
++     * Converts Markdown, reusing the last identical native conversion.
++     * @param {string} text Markdown after regexes and formatting preparation
++     * @param {import('showdown').Converter} converter Markdown converter
++     * @param {boolean} [enabled=true] False when Markdown exclusions can evaluate macros
++     * @returns {string} Converted HTML, before sanitization
++     */
++    render(text, converter, enabled = true) {
++        // Metadata parsing mutates converter state that callers can read afterward.
++        if (!enabled || !isNativeConverter(converter) || converter.getOption('metadata')) {
++            this.clear();
++            return converter.makeHtml(text);
++        }
++        const options = JSON.stringify(converter.getOptions());
++        if (this.#converter === converter && this.#options === options && this.#text === text) {
++            return this.#html;
++        }
++        const html = converter.makeHtml(text);
++        this.#converter = converter;
++        this.#options = options;
++        this.#text = text;
++        this.#html = html;
++        return html;
++    }
++}
+diff --git a/public/scripts/world-info.js b/public/scripts/world-info.js
+index 1941041a..7d75dc9d 100644
+--- a/public/scripts/world-info.js
++++ b/public/scripts/world-info.js
+@@ -196,7 +196,7 @@ const defaultGlobalScanData = Object.freeze({
+ /**
+  * Represents a scanning buffer for one evaluation of World Info.
+  */
+-class WorldInfoBuffer {
++export class WorldInfoBuffer {
+     /**
+      * @type {Map<string, object>} Map of entries that need to be activated no matter what
+      */
+@@ -232,6 +232,21 @@ class WorldInfoBuffer {
+      */
+     #startDepth = 0;
+ 
++    /** @type {Map<string, string>} Scan text by depth, enabled context fields and recursion mode. */
++    #scanCache = new Map();
++    /** @type {Map<string, string>} Case-folded scan text, shared across keyword matches. */
++    #caseFoldCache = new Map();
++    /** @type {WIGlobalScanData} Last observed context values. */
++    #cachedScanData;
++    static #scanFields = [
++        ['matchPersonaDescription', 'personaDescription'],
++        ['matchCharacterDescription', 'characterDescription'],
++        ['matchCharacterPersonality', 'characterPersonality'],
++        ['matchCharacterDepthPrompt', 'characterDepthPrompt'],
++        ['matchScenario', 'scenario'],
++        ['matchCreatorNotes', 'creatorNotes'],
++    ];
++
+     /**
+      * Initialize the buffer with the given messages.
+      * @param {string[]} messages Array of messages to add to the buffer
+@@ -240,6 +255,33 @@ class WorldInfoBuffer {
+     constructor(messages, globalScanData) {
+         this.#initDepthBuffer(messages);
+         this.#globalScanData = globalScanData;
++        this.#cachedScanData = { ...globalScanData };
++    }
++
++    /**
++     * Bounds both entry count and retained text. An oversized value can occupy
++     * the cache alone, so very long scans still benefit from keyword reuse.
++     * @param {Map<string, string>} cache Target cache
++     * @param {string} key Cache key
++     * @param {string} value Cached text
++     */
++    #cacheText(cache, key, value) {
++        let characters = key.length + value.length;
++        for (const [cachedKey, cachedValue] of cache) {
++            characters += cachedKey.length + cachedValue.length;
++        }
++        while (cache.size && (cache.size >= 16 || characters > 2 * 1024 * 1024)) {
++            const [oldKey, oldValue] = cache.entries().next().value;
++            characters -= oldKey.length + oldValue.length;
++            cache.delete(oldKey);
++        }
++        cache.set(key, value);
++    }
++
++    /** Invalidates derived text when the scan inputs change. */
++    #clearCache() {
++        this.#scanCache.clear();
++        this.#caseFoldCache.clear();
+     }
+ 
+     /**
+@@ -263,11 +305,17 @@ class WorldInfoBuffer {
+      * Gets a string that respects the case sensitivity setting
+      * @param {string} str The string to transform
+      * @param {WIScanEntry} entry The entry that triggered the scan
++     * @param {boolean} [cache=false] Reuse case folding for scan text, but not individual keys
+      * @returns {string} The transformed string
+     */
+-    #transformString(str, entry) {
++    #transformString(str, entry, cache = false) {
+         const caseSensitive = entry.caseSensitive ?? world_info_case_sensitive;
+-        return caseSensitive ? str : str.toLowerCase();
++        if (caseSensitive) return str;
++        if (!cache) return str.toLowerCase();
++        if (this.#caseFoldCache.has(str)) return this.#caseFoldCache.get(str);
++        const folded = str.toLowerCase();
++        this.#cacheText(this.#caseFoldCache, str, folded);
++        return folded;
+     }
+ 
+     /**
+@@ -292,6 +340,18 @@ class WorldInfoBuffer {
+             depth = MAX_SCAN_DEPTH;
+         }
+ 
++        // Context can be edited while an asynchronous scan is in progress.
++        if (WorldInfoBuffer.#scanFields.some(([, field]) => this.#cachedScanData[field] !== this.#globalScanData[field])) {
++            this.#clearCache();
++            this.#cachedScanData = { ...this.#globalScanData };
++        }
++        const flags = WorldInfoBuffer.#scanFields.reduce((mask, [flag], index) => entry[flag] ? mask | (1 << index) : mask, 0);
++        const includeRecursion = scanState !== scan_state.MIN_ACTIVATIONS;
++        const cacheKey = JSON.stringify([depth, this.#startDepth, flags, includeRecursion]);
++        if (this.#scanCache.has(cacheKey)) {
++            return this.#scanCache.get(cacheKey);
++        }
++
+         const MATCHER = '\x01';
+         const JOINER = '\n' + MATCHER;
+         let result = MATCHER + this.#depthBuffer.slice(this.#startDepth, depth).join(JOINER);
+@@ -320,10 +380,11 @@ class WorldInfoBuffer {
+         }
+ 
+         // Min activations should not include the recursion buffer
+-        if (this.#recurseBuffer.length > 0 && scanState !== scan_state.MIN_ACTIVATIONS) {
++        if (this.#recurseBuffer.length > 0 && includeRecursion) {
+             result += JOINER + this.#recurseBuffer.join(JOINER);
+         }
+ 
++        this.#cacheText(this.#scanCache, cacheKey, result);
+         return result;
+     }
+ 
+@@ -342,7 +403,7 @@ class WorldInfoBuffer {
+         }
+ 
+         // Otherwise we do normal matching of plaintext with the chosen entry settings
+-        haystack = this.#transformString(haystack, entry);
++        haystack = this.#transformString(haystack, entry, true);
+         const transformedString = this.#transformString(needle, entry);
+         const matchWholeWords = entry.matchWholeWords ?? world_info_match_whole_words;
+ 
+@@ -371,6 +432,7 @@ class WorldInfoBuffer {
+      */
+     addRecurse(message) {
+         this.#recurseBuffer.push(message);
++        this.#clearCache();
+     }
+ 
+     /**
+@@ -379,6 +441,7 @@ class WorldInfoBuffer {
+      */
+     addInject(message) {
+         this.#injectBuffer.push(message);
++        this.#clearCache();
+     }
+ 
+     /**
+@@ -394,6 +457,7 @@ class WorldInfoBuffer {
+      */
+     advanceScan() {
+         this.#skew++;
++        this.#clearCache();
+     }
+ 
+     /**
+diff --git a/src/endpoints/chats.js b/src/endpoints/chats.js
+index 390abc3c..f8f89190 100644
+--- a/src/endpoints/chats.js
++++ b/src/endpoints/chats.js
+@@ -380,19 +380,41 @@ async function checkChatIntegrity(filePath, integritySlug) {
+  * @property {boolean} [match] - Whether the chat matches the search criteria
+  */
+ 
++/**
++ * Matches all search fragments across successive messages without revisiting
++ * earlier messages. Create a separate matcher for every chat file.
++ * @param {string[]} fragments Lowercase search fragments
++ * @returns {ChatTextMatcher} Incremental matcher
++ * @typedef {{ test: (text: string) => boolean }} ChatTextMatcher
++ */
++export function createChatSearchMatcher(fragments) {
++    const remaining = new Set(fragments);
++    return {
++        test(text) {
++            if (remaining.size === 0) return true;
++            const normalized = String(text ?? '').toLowerCase();
++            for (const fragment of remaining) {
++                if (normalized.includes(fragment)) remaining.delete(fragment);
++            }
++            return remaining.size === 0;
++        },
++    };
++}
++
+ /**
+  * Reads the information from a chat file.
+  * @param {string} pathToFile - Path to the chat file
+  * @param {object} additionalData - Additional data to include in the result
+  * @param {boolean} withMetadata - Whether to read chat metadata
+- * @param {ChatMatchFunction|null} matcher - Optional function to match messages
++ * @param {ChatMatchFunction|ChatTextMatcher|null} matcher - Optional cumulative or incremental matcher
+  * @returns {Promise<ChatInfo>}
+  *
+  * @typedef {(textArray: string[]) => boolean} ChatMatchFunction
+  */
+ export async function getChatInfo(pathToFile, additionalData = {}, withMetadata = false, matcher = null) {
+     const parsedPath = path.parse(pathToFile);
+-    const hasMatcher = (typeof matcher === 'function');
++    const incrementalMatcher = typeof matcher === 'object' && typeof matcher?.test === 'function' ? matcher : null;
++    const hasMatcher = typeof matcher === 'function' || !!incrementalMatcher;
+ 
+     // A chat that is deleted while a scan is running is not an error: treat it like a corrupted chat and move on.
+     const chatVanished = () => {
+@@ -466,9 +488,13 @@ export async function getChatInfo(pathToFile, additionalData = {}, withMetadata
+             if (hasMatcher && !hasAnyMatch && itemCounter > 0) {
+                 const jsonData = tryParse(line);
+                 if (jsonData) {
+-                    matchBuffer.push(jsonData.mes || '');
+-                    if (matcher(matchBuffer)) {
+-                        hasAnyMatch = true;
++                    if (incrementalMatcher) {
++                        hasAnyMatch = incrementalMatcher.test(jsonData.mes || '');
++                    } else if (typeof matcher === 'function') {
++                        matchBuffer.push(jsonData.mes || '');
++                        hasAnyMatch = matcher(matchBuffer);
++                    }
++                    if (hasAnyMatch) {
+                         matchBuffer = [];
+                     }
+                 }
+@@ -1018,7 +1044,7 @@ router.post('/search', validateAvatarUrlMiddleware, async function (request, res
+         };
+ 
+         for (const chatFile of chatFiles) {
+-            const matcher = query ? hasTextMatch : null;
++            const matcher = query ? createChatSearchMatcher(fragments) : null;
+             const chatInfo = await getChatInfo(chatFile, {}, false, matcher);
+             const hasMatch = chatInfo.match || hasTextMatch([chatInfo.file_id ?? '']);
+ 
+diff --git a/tests/chat-search.node.mjs b/tests/chat-search.node.mjs
+new file mode 100644
+index 00000000..c6a56a93
+--- /dev/null
++++ b/tests/chat-search.node.mjs
+@@ -0,0 +1,99 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++import fs from 'node:fs/promises';
++import os from 'node:os';
++import path from 'node:path';
++
++process.env.SILLYTAVERN_BACKUPS_CHAT_ENABLED = 'false';
++process.env.SILLYTAVERN_BACKUPS_CHAT_MAXTOTALBACKUPS = '-1';
++process.env.SILLYTAVERN_BACKUPS_CHAT_THROTTLEINTERVAL = '0';
++process.env.SILLYTAVERN_BACKUPS_CHAT_CHECKINTEGRITY = 'true';
++const { createChatSearchMatcher, getChatInfo, router } = await import('../src/endpoints/chats.js');
++
++function jsonl(messages) {
++    return [
++        JSON.stringify({ chat_metadata: { note: 'metadata is not searchable' } }),
++        ...messages.map(mes => JSON.stringify({ name: 'Character', mes, send_date: '2026-01-01' })),
++    ].join('\n');
++}
++
++async function directory(t) {
++    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'st-search-'));
++    t.after(() => fs.rm(root, { recursive: true, force: true }));
++    return root;
++}
++
++test('incremental search preserves cumulative AND, case folding and literal matching', () => {
++    const queries = [['alpha', 'beta'], ['alpha', 'alpha'], ['魔女', 'beta'], ['a.b'], [], ['missing']];
++    const messages = ['ALPHA and aXb', '', '魔女 meets Beta', 'literal a.b'];
++    for (const fragments of queries) {
++        const matcher = createChatSearchMatcher(fragments);
++        const prefix = [];
++        for (const text of messages) {
++            prefix.push(text);
++            const expected = fragments.every(fragment => prefix.some(value => value.toLowerCase().includes(fragment)));
++            assert.equal(matcher.test(text), expected);
++        }
++    }
++});
++
++test('a missing word normalizes each new message once', () => {
++    let visits = 0;
++    const matcher = createChatSearchMatcher(['missing']);
++    for (let i = 0; i < 10000; i++) {
++        assert.equal(matcher.test({ toString() { visits++; return 'other words'; } }), false);
++    }
++    assert.equal(visits, 10000);
++});
++
++test('chat scanning reads each message once and keeps final preview and counts', async (t) => {
++    const root = await directory(t);
++    const file = path.join(root, 'chat.jsonl');
++    await fs.writeFile(file, jsonl(['ALPHA', 'middle', 'BETA', 'final']));
++    const matcher = createChatSearchMatcher(['alpha', 'beta']);
++    const visited = [];
++    const info = await getChatInfo(file, {}, true, {
++        test(text) { visited.push(text); return matcher.test(text); },
++    });
++    assert.deepEqual(visited, ['ALPHA', 'middle', 'BETA']);
++    assert.equal(info.match, true);
++    assert.equal(info.chat_items, 4);
++    assert.equal(info.mes, 'final');
++    assert.equal(info.chat_metadata.note, 'metadata is not searchable');
++    assert.equal((await getChatInfo(file, {}, false, createChatSearchMatcher(['metadata']))).match, false);
++});
++
++test('legacy cumulative matchers and damaged final lines retain their behavior', async (t) => {
++    const root = await directory(t);
++    const file = path.join(root, 'chat.jsonl');
++    await fs.writeFile(file, jsonl(['alpha', 'beta']) + '\n{"broken');
++    const prefixes = [];
++    const info = await getChatInfo(file, {}, false, texts => {
++        prefixes.push([...texts]);
++        return texts.some(text => text === 'alpha') && texts.some(text => text === 'beta');
++    });
++    assert.deepEqual(prefixes, [['alpha'], ['alpha', 'beta']]);
++    assert.equal(info.match, true);
++    assert.equal(info.chat_items, 2);
++    assert.equal((await getChatInfo(file, {}, false, createChatSearchMatcher(['alpha', 'beta']))).match, true);
++    assert.equal((await getChatInfo(file, {}, false, createChatSearchMatcher(['missing']))).match, false);
++});
++
++test('search route isolates chat matches and retains independent filename matching', async (t) => {
++    const root = await directory(t);
++    const character = path.join(root, 'Character');
++    await fs.mkdir(character);
++    await fs.writeFile(path.join(character, 'only-alpha.jsonl'), jsonl(['ALPHA']));
++    await fs.writeFile(path.join(character, 'only-beta.jsonl'), jsonl(['BETA']));
++    await fs.writeFile(path.join(character, 'both.jsonl'), jsonl(['alpha', 'beta']));
++    await fs.writeFile(path.join(character, 'alpha beta.jsonl'), '');
++    // A filename fragment and a message fragment must not be combined.
++    await fs.writeFile(path.join(character, 'alpha.jsonl'), jsonl(['beta']));
++    const handler = router.stack.find(layer => layer.route?.path === '/search').route.stack.at(-1).handle;
++    let result;
++    await handler(
++        { body: { query: 'ALPHA beta', avatar_url: 'Character.png' }, user: { directories: { chats: root } } },
++        { send(value) { result = value; }, status(code) { throw new Error(`Unexpected status ${code}`); } },
++    );
++    assert.deepEqual(result.map(item => item.file_name).sort(), ['alpha beta', 'both']);
++});
+diff --git a/tests/markdown-cache.node.mjs b/tests/markdown-cache.node.mjs
+new file mode 100644
+index 00000000..7e23c7b1
+--- /dev/null
++++ b/tests/markdown-cache.node.mjs
+@@ -0,0 +1,92 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++import showdown from 'showdown';
++import { MarkdownRenderCache, trackMarkdownConverter } from '../public/scripts/util/markdown-cache.js';
++
++function fixture() {
++    const converter = new showdown.Converter({ tables: true });
++    const makeHtml = converter.makeHtml;
++    let calls = 0;
++    converter.makeHtml = function (text) {
++        calls++;
++        return makeHtml.call(this, text);
++    };
++    trackMarkdownConverter(converter);
++    return { converter, cache: new MarkdownRenderCache(), calls: () => calls };
++}
++
++test('unchanged reasoning converts once, with the same Markdown result', () => {
++    const { converter, cache, calls } = fixture();
++    const text = '**Reasoning**\n\n- first\n- second\n\n```js\nconst x = 1 < 2;\n```';
++    const expected = new showdown.Converter({ tables: true }).makeHtml(text);
++    for (let i = 0; i < 100; i++) assert.equal(cache.render(text, converter), expected);
++    assert.equal(calls(), 1);
++    assert.notEqual(cache.render(text + '\n\nDone.', converter), expected);
++    assert.equal(calls(), 2);
++    cache.clear();
++    cache.render(text + '\n\nDone.', converter);
++    assert.equal(calls(), 3);
++});
++
++test('converter options and replacement converters invalidate the previous result', () => {
++    const { converter, cache, calls } = fixture();
++    const text = 'line one\nline two';
++    const original = cache.render(text, converter);
++    converter.setOption('simpleLineBreaks', true);
++    assert.notEqual(cache.render(text, converter), original);
++    assert.equal(calls(), 2);
++    const next = fixture();
++    assert.equal(cache.render(text, next.converter), original);
++    assert.equal(next.calls(), 1);
++});
++
++test('custom extensions, listeners and makeHtml replacements still run on each call', () => {
++    const { converter, cache } = fixture();
++    cache.render('content', converter);
++    let version = 0;
++    converter.addExtension({ type: 'output', filter: html => html + ++version }, 'dynamic');
++    assert.match(cache.render('content', converter), /1$/);
++    assert.match(cache.render('content', converter), /2$/);
++
++    const next = fixture();
++    next.cache.render('content', next.converter);
++    let events = 0;
++    next.converter.listen('blockGamut.before', () => { events++; });
++    next.cache.render('content', next.converter);
++    next.cache.render('content', next.converter);
++    assert.equal(events, 2);
++
++    const last = fixture();
++    last.cache.render('content', last.converter);
++    let changes = 0;
++    last.converter.makeHtml = () => String(++changes);
++    assert.equal(last.cache.render('content', last.converter), '1');
++    assert.equal(last.cache.render('content', last.converter), '2');
++});
++
++test('mutating a registered extension disables reuse', () => {
++    const converter = new showdown.Converter();
++    converter.addExtension({ type: 'output', filter: text => text }, 'native');
++    trackMarkdownConverter(converter);
++    const cache = new MarkdownRenderCache();
++    cache.render('content', converter);
++    let changes = 0;
++    converter.getAllExtensions().output[0].filter = () => String(++changes);
++    assert.equal(cache.render('content', converter), '1');
++    assert.equal(cache.render('content', converter), '2');
++});
++
++test('macro exclusions and metadata parsing bypass the cache', () => {
++    const { converter, cache, calls } = fixture();
++    cache.render('same', converter);
++    cache.render('same', converter, false);
++    cache.render('same', converter, false);
++    cache.render('same', converter);
++    assert.equal(calls(), 4);
++    converter.setOption('metadata', true);
++    const text = '---\ntitle: Reasoning\n---\n\nsame';
++    cache.render(text, converter);
++    converter.makeHtml('---\ntitle: Body\n---\n\nbody');
++    cache.render(text, converter);
++    assert.equal(converter.getMetadata().title, 'Reasoning');
++});
+diff --git a/tests/native-scan-render.node.mjs b/tests/native-scan-render.node.mjs
+new file mode 100644
+index 00000000..8b59acfd
+--- /dev/null
++++ b/tests/native-scan-render.node.mjs
+@@ -0,0 +1,208 @@
++import assert from 'node:assert/strict';
++import { test, before, after } from 'node:test';
++
++// Run against an isolated server with ST_BASE_URL set. No model requests are made.
++const baseURL = process.env.ST_BASE_URL;
++let browser;
++before(async () => {
++    if (!baseURL) return;
++    const { chromium } = await import(process.env.ST_PLAYWRIGHT_MODULE || 'playwright');
++    browser = await chromium.launch({ channel: process.env.ST_BROWSER_CHANNEL });
++});
++after(async () => { await browser?.close(); });
++
++async function openPage(t) {
++    const context = await browser.newContext();
++    t.after(() => context.close());
++    await context.route('**/*', route => new URL(route.request().url()).origin === new URL(baseURL).origin
++        ? route.continue() : route.abort());
++    const page = await context.newPage();
++    await page.goto(baseURL);
++    await page.waitForFunction(() => window.SillyTavern && !document.getElementById('preloader'));
++    return page;
++}
++
++test('worldbook scan caching preserves context, recursion, keyword and score semantics', { skip: !baseURL }, async (t) => {
++    const page = await openPage(t);
++    const result = await page.evaluate(async () => {
++        const { WorldInfoBuffer, scan_state, world_info_depth, world_info_logic } = await import('/scripts/world-info.js');
++        const messages = ['  Latest ALPHA 魔女  ', 'second BETA', '', 'old GAMMA'];
++        const data = {
++            personaDescription: 'Persona', characterDescription: 'Description',
++            characterPersonality: 'Personality', characterDepthPrompt: 'Depth',
++            scenario: 'Scenario', creatorNotes: 'Notes',
++        };
++        const fields = [
++            ['matchPersonaDescription', 'personaDescription'],
++            ['matchCharacterDescription', 'characterDescription'],
++            ['matchCharacterPersonality', 'characterPersonality'],
++            ['matchCharacterDepthPrompt', 'characterDepthPrompt'],
++            ['matchScenario', 'scenario'],
++            ['matchCreatorNotes', 'creatorNotes'],
++        ];
++        const buffer = new WorldInfoBuffer(messages, data);
++        let checks = 0;
++        const verify = (actual, expected) => {
++            if (actual !== expected) throw new Error(`Mismatch: ${JSON.stringify({ actual, expected })}`);
++            checks++;
++        };
++        const injected = [];
++        const recursive = [];
++        let skew = 0;
++        // Reference assembly keeps the original separator and sparse-message behavior.
++        function reference(entry, state) {
++            const depth = Math.min(entry.scanDepth ?? world_info_depth + skew, 1000);
++            if (depth <= 0) return '';
++            let text = '\x01' + messages.slice(0, depth).map(text => text.trim()).join('\n\x01');
++            for (const [flag, field] of fields) {
++                if (entry[flag] && data[field]) text += '\n\x01' + data[field];
++            }
++            if (injected.length) text += '\n\x01' + injected.join('\n\x01');
++            if (recursive.length && state !== scan_state.MIN_ACTIVATIONS) text += '\n\x01' + recursive.join('\n\x01');
++            return text;
++        }
++        function checkConfigurations() {
++            for (let flags = 0; flags < 64; flags++) {
++                const entry = Object.fromEntries(fields.map(([flag], index) => [flag, Boolean(flags & (1 << index))]));
++                for (const depth of [0, 1, 2, 4, undefined]) {
++                    entry.scanDepth = depth;
++                    for (const state of [scan_state.INITIAL, scan_state.RECURSION, scan_state.MIN_ACTIVATIONS]) {
++                        verify(buffer.get(entry, state), reference(entry, state));
++                        verify(buffer.get({ ...entry }, state), reference(entry, state));
++                    }
++                }
++            }
++        }
++        checkConfigurations();
++        buffer.addInject('INJECT');
++        injected.push('INJECT');
++        buffer.addRecurse('RECURSE');
++        recursive.push('RECURSE');
++        checkConfigurations();
++        buffer.advanceScan();
++        skew++;
++        data.personaDescription = 'Changed persona';
++        checkConfigurations();
++        const entry = { scanDepth: 2, key: ['alpha', '魔女'], keysecondary: ['beta'], selectiveLogic: world_info_logic.AND_ALL };
++        const text = buffer.get(entry, scan_state.INITIAL);
++        for (const [key, options, expected] of [
++            ['alpha', {}, true], ['alpha', { caseSensitive: true }, false],
++            ['ALPHA', { caseSensitive: true }, true], ['pha', { matchWholeWords: true }, false],
++            ['alpha', { matchWholeWords: true }, true], ['魔女', {}, true],
++            ['/ALPHA/', {}, true], ['/alpha/', {}, false], ['/alpha/i', {}, true],
++            ['missing', {}, false],
++        ]) {
++            verify(buffer.matchKeys(text, key, options), expected);
++        }
++        verify(buffer.getScore(entry, scan_state.INITIAL), 3);
++        entry.selectiveLogic = world_info_logic.NOT_ANY;
++        verify(buffer.getScore(entry, scan_state.INITIAL), 2);
++        const other = new WorldInfoBuffer(['different chat'], data);
++        verify(other.matchKeys(other.get({ scanDepth: 2 }, scan_state.INITIAL), 'alpha', {}), false);
++
++        // Count expensive operations for identical scans and different keywords.
++        const fresh = new WorldInfoBuffer(messages, data);
++        const join = Array.prototype.join;
++        const lower = String.prototype.toLowerCase;
++        let joins = 0;
++        let folds = 0;
++        let scanText;
++        try {
++            Array.prototype.join = function (separator) {
++                if (separator === '\n\x01') joins++;
++                return join.call(this, separator);
++            };
++            String.prototype.toLowerCase = function () {
++                if (String(this) === scanText) folds++;
++                return lower.call(this);
++            };
++            for (let i = 0; i < 100; i++) {
++                scanText = fresh.get({ scanDepth: 2 }, scan_state.INITIAL);
++                fresh.matchKeys(scanText, `missing-${i}`, {});
++            }
++        } finally {
++            Array.prototype.join = join;
++            String.prototype.toLowerCase = lower;
++        }
++        return { checks, joins, folds };
++    });
++    assert.ok(result.checks > 5000);
++    assert.equal(result.joins, 1);
++    assert.equal(result.folds, 1);
++});
++
++test('reasoning reuses Markdown while regex macros, display settings, hooks and sanitization stay live', { skip: !baseURL }, async (t) => {
++    const page = await openPage(t);
++    const result = await page.evaluate(async () => {
++        const st = await import('/script.js');
++        const { power_user } = await import('/scripts/power-user.js');
++        const { extension_settings } = await import('/scripts/extensions.js');
++        const { regex_placement } = await import('/scripts/extensions/regex/engine.js');
++        const { ReasoningHandler } = await import('/scripts/reasoning.js');
++        const { MessageFormatter } = await import('/scripts/message-formatter.js');
++        const { trackMarkdownConverter } = await import('/scripts/util/markdown-cache.js');
++        const verify = (condition, message) => { if (!condition) throw new Error(message); };
++        power_user.markdown_escape_strings = '';
++        power_user.stream_fade_in = false;
++        st.reloadMarkdownProcessor();
++        extension_settings.disabledExtensions = extension_settings.disabledExtensions.filter(name => name !== 'regex');
++        extension_settings.regex = [{
++            id: 'cache-regex', scriptName: 'Cache fixture', findRegex: '/TOKEN/g',
++            replaceString: '{{getvar::cache_value}}', trimStrings: [],
++            placement: [regex_placement.REASONING], markdownOnly: true, promptOnly: false,
++            runOnEdit: true, substituteRegex: 0, minDepth: 0, maxDepth: 0,
++        }];
++        st.chat_metadata.variables = { cache_value: 'ALPHA' };
++        st.chat.length = 0;
++        st.chat.push({
++            name: 'Character', mes: 'Body', is_user: false, is_system: false,
++            send_date: '2026-01-01', extra: { reasoning: 'TOKEN **thought** <b>bold</b>\n\n```js\nconst x = 1 < 2;\n```' },
++        });
++        document.getElementById('chat').replaceChildren();
++        st.addOneMessage(st.chat[0], { forceId: 0, scroll: false, showSwipes: false });
++        let conversions = 0;
++        const makeHtml = st.converter.makeHtml;
++        st.converter.makeHtml = function (text) { conversions++; return makeHtml.call(this, text); };
++        trackMarkdownConverter(st.converter);
++        const handler = new ReasoningHandler();
++        handler.initHandleMessage(0);
++        const thought = document.querySelector('#chat .mes_reasoning');
++        verify(thought.textContent.includes('ALPHA'), 'Initial regex macro did not run');
++        const first = conversions;
++        for (let i = 0; i < 100; i++) handler.updateDom(0);
++        verify(conversions === first, 'Unchanged reasoning repeated Markdown conversion');
++        handler.updateDom(0, { force: true });
++        verify(conversions === first + 1, 'Final render did not refresh Markdown');
++        st.chat_metadata.variables.cache_value = 'BETA';
++        handler.updateDom(0);
++        verify(thought.textContent.includes('BETA'), 'Macro change was cached');
++        extension_settings.regex[0].replaceString = 'GAMMA';
++        handler.updateDom(0);
++        verify(thought.textContent.includes('GAMMA'), 'Regex change was cached');
++        power_user.encode_tags = true;
++        handler.updateDom(0);
++        verify(thought.textContent.includes('<b>bold</b>'), 'Tag display setting was cached');
++        handler.reasoningDisplayText = '**Translated**';
++        handler.updateDom(0);
++        verify(thought.textContent.includes('Translated'), 'Translated reasoning was cached');
++        handler.reasoningDisplayText = null;
++        handler.updateDom(0);
++        verify(thought.textContent.includes('GAMMA'), 'Restored reasoning was cached');
++
++        let beforeCalls = 0;
++        let afterCalls = 0;
++        MessageFormatter.addHook(text => { beforeCalls++; return text; }, { stage: MessageFormatter.stage.BEFORE_REGEX });
++        MessageFormatter.addHook(text => text + `<span>version-${++afterCalls}</span><img src="bad" onerror="alert(1)"><script>alert(1)</script>`);
++        const beforeHooks = conversions;
++        handler.updateDom(0);
++        handler.updateDom(0);
++        verify(beforeCalls === 2 && afterCalls === 2, 'Formatter hooks were skipped');
++        verify(conversions === beforeHooks, 'Hooks prevented reuse of unchanged Markdown');
++        verify(thought.textContent.includes('version-2'), 'Dynamic hook output did not update');
++        verify(!thought.querySelector('script, [onerror]'), 'Unsafe HTML survived sanitization');
++        return { initialConversions: first, repeatedUpdates: 100, beforeCalls, afterCalls };
++    });
++    assert.equal(result.initialConversions, 1);
++    assert.equal(result.beforeCalls, 2);
++    assert.equal(result.afterCalls, 2);
++});

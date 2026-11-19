@@ -1,0 +1,634 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Thu, 22 Oct 2026 19:53:08 +0900
+Subject: [PATCH 13/31] Avoid quadratic span expansion and repeated work in
+ streaming fades
+
+---
+ public/scripts/util/showdown-patch.js |  78 +++++++++++---
+ public/scripts/util/stream-fadein.js  |  89 +++++++++++++---
+ tests/bench-stream-render.mjs         | 101 ++++++++++++++++++
+ tests/frontend/StreamFadeIn.e2e.js    | 141 +++++++++++++++++++++++++
+ tests/showdown-patch.node.mjs         | 143 ++++++++++++++++++++++++++
+ 5 files changed, 525 insertions(+), 27 deletions(-)
+ create mode 100644 tests/bench-stream-render.mjs
+ create mode 100644 tests/frontend/StreamFadeIn.e2e.js
+ create mode 100644 tests/showdown-patch.node.mjs
+
+diff --git a/public/scripts/util/showdown-patch.js b/public/scripts/util/showdown-patch.js
+index d11ce572..5e1ac144 100644
+--- a/public/scripts/util/showdown-patch.js
++++ b/public/scripts/util/showdown-patch.js
+@@ -1,3 +1,22 @@
++/** Original ordered expansion for unusual extension-provided spans. */
++function replaceSpansSequentially(text, spans) {
++    for (let index = 0; index < spans.length; index++) {
++        let replacement = spans[index];
++        let limit = 0;
++        while (/¨C(\d+)C/.test(replacement)) {
++            const nestedIndex = RegExp.$1;
++            replacement = replacement.replace('¨C' + nestedIndex + 'C', spans[nestedIndex]);
++            if (limit === 10000) {
++                console.error('maximum nesting of 10000 spans reached!!!');
++                break;
++            }
++            limit++;
++        }
++        text = text.replace('¨C' + index + 'C', replacement);
++    }
++    return text;
++}
++
+ /**
+  * Patches showdown to unrestrictedly unhash HTML spans.
+  * @param {import('showdown')} showdown The showdown object to patch
+@@ -6,22 +25,55 @@ export function addShowdownPatch(showdown) {
+     showdown.subParser('unhashHTMLSpans', function (text, options, globals) {
+         'use strict';
+         text = globals.converter._dispatch('unhashHTMLSpans.before', text, options, globals);
+-
+-        for (var i = 0; i < globals.gHtmlSpans.length; ++i) {
+-            var repText = globals.gHtmlSpans[i],
+-                // limiter to prevent infinite loop (assume 10 as limit for recurse)
+-                limit = 0;
+-
+-            while (/¨C(\d+)C/.test(repText)) {
+-                var num = RegExp.$1;
+-                repText = repText.replace('¨C' + num + 'C', globals.gHtmlSpans[num]);
+-                if (limit === 10000) {
+-                    console.error('maximum nesting of 10000 spans reached!!!');
++        const spans = globals.gHtmlSpans;
++        const replacements = [];
++        // Native hashed spans are complete HTML elements. Other values and
++        // special String.replace substitutions need the original ordered path.
++        // HTML boundaries prevent replacements creating tokens with neighbors.
++        let canReplaceTogether = Array.isArray(spans);
++        for (let index = 0; index < spans.length; index++) {
++            const span = spans[index];
++            if (typeof span !== 'string' || !span.startsWith('<') || !span.endsWith('>') || /\$[$&`']/.test(span)) {
++                canReplaceTogether = false;
++                break;
++            }
++        }
++        if (canReplaceTogether) {
++            for (const span of spans) {
++                let replacement = span;
++                let limit = 0;
++                while (/¨C(\d+)C/.test(replacement)) {
++                    const nestedIndex = RegExp.$1;
++                    replacement = replacement.replace('¨C' + nestedIndex + 'C', spans[nestedIndex]);
++                    if (++limit > 10000) {
++                        canReplaceTogether = false;
++                        break;
++                    }
++                }
++                if (!canReplaceTogether) break;
++                // Extensions can attach non-index keys (for example "01") to
++                // the span table. Their expansion may reintroduce special
++                // replacement syntax, so validate the resolved value as well.
++                if (!replacement.startsWith('<') || !replacement.endsWith('>') || /¨C\d+C|\$[$&`']/.test(replacement)) {
++                    canReplaceTogether = false;
+                     break;
+                 }
+-                ++limit;
++                replacements.push(replacement);
+             }
+-            text = text.replace('¨C' + i + 'C', repText);
++        }
++        if (canReplaceTogether) {
++            // Scanning the entire reply once per span is quadratic for long
++            // messages containing many inline tags (including quoted dialogue).
++            // Replace only the first occurrence of each index, as before.
++            const replaced = new Set();
++            text = text.replace(/¨C(0|[1-9]\d*)C/g, (token, digits) => {
++                const index = Number(digits);
++                if (index >= replacements.length || replaced.has(index)) return token;
++                replaced.add(index);
++                return replacements[index];
++            });
++        } else {
++            text = replaceSpansSequentially(text, spans);
+         }
+ 
+         text = globals.converter._dispatch('unhashHTMLSpans.after', text, options, globals);
+diff --git a/public/scripts/util/stream-fadein.js b/public/scripts/util/stream-fadein.js
+index fd76831f..d3743562 100644
+--- a/public/scripts/util/stream-fadein.js
++++ b/public/scripts/util/stream-fadein.js
+@@ -1,5 +1,64 @@
+ import { morphdom } from '../../lib.js';
+ 
++// A bounded cache of detached templates avoids rebuilding the same word spans
++// in completed paragraphs on every token. Callers only receive clones.
++const segmentTemplates = new Map();
++const segmenters = new Map();
++const MAX_CACHED_SEGMENTS = 4096;
++const MAX_CACHED_CHARACTERS = 65536;
++const MAX_CACHED_TEMPLATES = 128;
++let cachedSegments = 0;
++let cachedCharacters = 0;
++
++/**
++ * @param {string} text Text node contents
++ * @param {'word'|'grapheme'|'sentence'} granularity Segmentation granularity
++ * @returns {DocumentFragment} Detached spans, owned by the caller
++ */
++function createTextSegments(text, granularity) {
++    const key = `${granularity}:${text}`;
++    const cached = segmentTemplates.get(key);
++    if (cached) {
++        segmentTemplates.delete(key);
++        segmentTemplates.set(key, cached);
++        return /** @type {DocumentFragment} */ (cached.fragment.cloneNode(true));
++    }
++
++    let segmenter = segmenters.get(granularity);
++    if (!segmenter) {
++        segmenter = new Intl.Segmenter('en-US', { granularity });
++        segmenters.set(granularity, segmenter);
++    }
++    const fragment = document.createDocumentFragment();
++    let segmentCount = 0;
++    for (const segment of segmenter.segment(text)) {
++        const span = document.createElement('span');
++        span.innerText = segment.segment;
++        span.className = 'text_segment';
++        fragment.appendChild(span);
++        segmentCount++;
++    }
++
++    // Large single text nodes still render normally without retaining another
++    // copy. Bound both source strings and the much heavier DOM span templates.
++    if (segmentCount > MAX_CACHED_SEGMENTS || text.length > MAX_CACHED_CHARACTERS) {
++        return fragment;
++    }
++    while (segmentTemplates.size >= MAX_CACHED_TEMPLATES
++        || cachedSegments + segmentCount > MAX_CACHED_SEGMENTS
++        || cachedCharacters + text.length > MAX_CACHED_CHARACTERS) {
++        const oldestKey = segmentTemplates.keys().next().value;
++        const oldest = segmentTemplates.get(oldestKey);
++        cachedSegments -= oldest.segmentCount;
++        cachedCharacters -= oldest.textLength;
++        segmentTemplates.delete(oldestKey);
++    }
++    segmentTemplates.set(key, { fragment, segmentCount, textLength: text.length });
++    cachedSegments += segmentCount;
++    cachedCharacters += text.length;
++    return /** @type {DocumentFragment} */ (fragment.cloneNode(true));
++}
++
+ /**
+  * Creates a content writer scoped to one streaming handler.
+  * Formatting still runs on every update; only identical DOM writes are skipped.
+@@ -48,8 +107,6 @@ export function segmentTextInElement(htmlElement, htmlContent, granularity = 'wo
+         return;
+     }
+ 
+-    // TODO: Support more locales, make granularity configurable.
+-    const segmenter = new Intl.Segmenter('en-US', { granularity });
+     const textNodes = [];
+     const walker = document.createTreeWalker(htmlElement, NodeFilter.SHOW_TEXT);
+     while (walker.nextNode()) {
+@@ -70,17 +127,7 @@ export function segmentTextInElement(htmlElement, htmlContent, granularity = 'wo
+ 
+     // Split every text node into segments using spans
+     for (const textNode of textNodes) {
+-        const fragment = document.createDocumentFragment();
+-        const segments = segmenter.segment(textNode.data);
+-        for (const segment of segments) {
+-            // TODO: Apply a different class for different segment length/content?
+-            // For now, just use a single class for all segments.
+-            const span = document.createElement('span');
+-            span.innerText = segment.segment;
+-            span.className = 'text_segment';
+-            fragment.appendChild(span);
+-        }
+-        textNode.replaceWith(fragment);
++        textNode.replaceWith(createTextSegments(textNode.data, granularity));
+     }
+ }
+ 
+@@ -92,5 +139,19 @@ export function segmentTextInElement(htmlElement, htmlContent, granularity = 'wo
+ export function applyStreamFadeIn(messageTextElement, htmlContent) {
+     const targetElement = /** @type {HTMLElement} */ (messageTextElement.cloneNode());
+     segmentTextInElement(targetElement, htmlContent);
+-    morphdom(messageTextElement, targetElement);
++    morphdom(messageTextElement, targetElement, {
++        onBeforeElUpdated: (fromElement, toElement) => {
++            // Most paragraphs are unchanged while the last one grows. Avoid
++            // visiting every existing word span in those completed paragraphs.
++            // Form controls also have mutable properties that isEqualNode does
++            // not compare. Keyed descendants must be visited so morphdom removes
++            // their IDs from its unmatched-node index before adding other nodes.
++            if (fromElement.isEqualNode(toElement)
++                && !fromElement.matches('input, textarea, select, option')
++                && !fromElement.querySelector('input, textarea, select, option, [id]')) {
++                return false;
++            }
++            return true;
++        },
++    });
+ }
+diff --git a/tests/bench-stream-render.mjs b/tests/bench-stream-render.mjs
+new file mode 100644
+index 00000000..ab6a5d0d
+--- /dev/null
++++ b/tests/bench-stream-render.mjs
+@@ -0,0 +1,101 @@
++import { chromium } from '@playwright/test';
++import { execFileSync } from 'node:child_process';
++import { testSetup } from './frontend/frontent-test-utils.js';
++
++const baseURL = process.env.ST_BASE_URL || 'http://127.0.0.1:18348';
++const browser = await chromium.launch();
++try {
++    const page = await browser.newPage({ baseURL });
++    // A/B against a committed implementation without touching the checkout.
++    if (process.env.ST_STREAM_BASELINE) {
++        for (const file of ['stream-fadein.js', 'showdown-patch.js']) {
++            const source = execFileSync('git', ['show', `${process.env.ST_STREAM_BASELINE}:public/scripts/util/${file}`], { encoding: 'utf8' });
++            await page.route(`**/scripts/util/${file}`, route => route.fulfill({ contentType: 'application/javascript', body: source }));
++        }
++    }
++    await page.route('**/api/settings/save', route => route.fulfill({ json: { result: 'ok' } }));
++    await testSetup.awaitST({ page });
++    const profiler = process.env.STREAM_PROFILE ? await page.context().newCDPSession(page) : null;
++    if (profiler) {
++        await profiler.send('Profiler.enable');
++        await profiler.send('Profiler.start');
++    }
++    const result = await page.evaluate(async () => {
++        const st = await import('/script.js');
++        const { applyStreamFadeIn, segmentTextInElement } = await import('/scripts/util/stream-fadein.js');
++        const { DOMPurify } = await import('/lib.js');
++        const { power_user } = await import('/scripts/power-user.js');
++        const { extension_settings } = await import('/scripts/extensions.js');
++        const { runRegexScript } = await import('/scripts/extensions/regex/engine.js');
++        extension_settings.regex = [];
++        power_user.markdown_escape_strings = '';
++        power_user.message_token_count_enabled = false;
++        const converter = st.reloadMarkdownProcessor();
++        const makeHtml = converter.makeHtml;
++        const sanitize = DOMPurify.sanitize;
++        let markdownMs = 0;
++        let sanitizeMs = 0;
++        converter.makeHtml = function (...args) {
++            const start = performance.now();
++            const result = makeHtml.apply(this, args);
++            markdownMs += performance.now() - start;
++            return result;
++        };
++        DOMPurify.sanitize = function (...args) {
++            const start = performance.now();
++            const result = sanitize.apply(this, args);
++            sanitizeMs += performance.now() - start;
++            return result;
++        };
++        const summarize = values => {
++            const sorted = values.toSorted((a, b) => a - b);
++            return { totalMs: +values.reduce((sum, value) => sum + value, 0).toFixed(1), medianMs: +sorted[Math.floor(sorted.length / 2)].toFixed(2), p95Ms: +sorted[Math.floor(sorted.length * 0.95)].toFixed(2) };
++        };
++        const measure = (samples, callback) => samples.map(sample => {
++            const start = performance.now();
++            callback(sample);
++            return performance.now() - start;
++        });
++        const ticks = 12;
++        const rows = [];
++        for (const targetLength of [4096, 32768, 131072]) {
++            const paragraph = index => `Paragraph ${index}: **The traveler** said, "A growing answer stays readable." 日本語の文章も少し含めます。\n\n`;
++            let body = '';
++            for (let index = 0; body.length < targetLength; index++) body += paragraph(index);
++            const samples = Array.from({ length: ticks }, (_, index) => body + 'Continuing answer '.repeat(index + 1));
++            st.messageFormatting(samples[0], 'Assistant', false, false, -1);
++            markdownMs = 0;
++            sanitizeMs = 0;
++            const html = [];
++            const format = summarize(measure(samples, text => html.push(st.messageFormatting(text, 'Assistant', false, false, -1))));
++            const breakdown = { markdownMs: +markdownMs.toFixed(1), sanitizeMs: +sanitizeMs.toFixed(1) };
++            const element = document.createElement('div');
++            const segmented = summarize(measure(html, text => segmentTextInElement(element, text)));
++            element.innerHTML = '';
++            const fade = summarize(measure(html, text => applyStreamFadeIn(element, text)));
++            const innerHTML = summarize(measure(html, text => { element.innerHTML = text; }));
++            const regex = { findRegex: '/(traveler)/g', replaceString: '<em>$1</em>', trimStrings: [], substituteRegex: 0 };
++            const regexTime = summarize(measure(samples, text => runRegexScript(regex, text)));
++            rows.push({ chars: body.length, ticks, format, ...breakdown, segmented, fade, innerHTML, regex: regexTime });
++        }
++        return { userAgent: navigator.userAgent, rows };
++    });
++    if (profiler) {
++        const { profile } = await profiler.send('Profiler.stop');
++        const selfTime = new Map();
++        for (let index = 0; index < profile.samples.length; index++) {
++            const id = profile.samples[index];
++            selfTime.set(id, (selfTime.get(id) ?? 0) + profile.timeDeltas[index]);
++        }
++        result.hotspots = profile.nodes.map(node => ({
++            function: node.callFrame.functionName,
++            url: node.callFrame.url,
++            line: node.callFrame.lineNumber + 1,
++            selfMs: Math.round((selfTime.get(node.id) ?? 0) / 1000),
++        })).sort((a, b) => b.selfMs - a.selfMs).slice(0, 20);
++    }
++    result.implementation = process.env.ST_STREAM_BASELINE || 'working tree';
++    console.log(JSON.stringify(result, null, 2));
++} finally {
++    await browser.close();
++}
+diff --git a/tests/frontend/StreamFadeIn.e2e.js b/tests/frontend/StreamFadeIn.e2e.js
+new file mode 100644
+index 00000000..f0536be0
+--- /dev/null
++++ b/tests/frontend/StreamFadeIn.e2e.js
+@@ -0,0 +1,141 @@
++import { test, expect } from '@playwright/test';
++import { testSetup } from './frontent-test-utils.js';
++
++test.beforeEach(testSetup.awaitST);
++
++test('growing and revised content matches full morphing, including mutable form controls', async ({ page }) => {
++    const result = await page.evaluate(async () => {
++        const { applyStreamFadeIn } = await import('/scripts/util/stream-fadein.js');
++        const { morphdom } = await import('/lib.js');
++        const expected = document.createElement('div');
++        const actual = document.createElement('div');
++        const snapshots = [];
++        const inputs = [
++            '<p id="stable">Completed paragraph 日本語 👩🏽‍💻</p><p>Growing</p>',
++            '<p id="stable">Completed paragraph 日本語 👩🏽‍💻</p><p>Growing <strong>emphasis</strong></p>',
++            '<p id="stable">Completed paragraph 日本語 👩🏽‍💻</p><pre><code>Do not split code\nline two</code></pre><p>Next</p>',
++            '<ul><li>Rewritten beginning</li><li>Another item</li></ul><p id="stable">Completed paragraph 日本語 👩🏽‍💻</p>',
++            '<div><input value="original"><input type="checkbox"><textarea>original</textarea><select><option>first</option><option>second</option></select></div><p>Tail</p>',
++            '<div><input value="original"><input type="checkbox"><textarea>original</textarea><select><option>first</option><option>second</option></select></div><p>Tail grows</p>',
++            '<div data-new="yes"><p>Replacement after forms</p></div>',
++            '<section><span id="shared">keep</span></section><p>tail</p>',
++            '<section><span id="shared">keep</span></section><p><span id="shared">new</span></p>',
++            '<section></section><p><span id="shared">moved</span></p>',
++        ];
++        let stableNode;
++        let stablePreserved = false;
++        for (let index = 0; index < inputs.length; index++) {
++            // Compatibility oracle: the previous full segmentation/morph path.
++            const target = document.createElement('div');
++            target.innerHTML = inputs[index];
++            const walker = document.createTreeWalker(target, NodeFilter.SHOW_TEXT);
++            const nodes = [];
++            while (walker.nextNode()) nodes.push(walker.currentNode);
++            for (const node of nodes) {
++                if (node.parentElement.closest('pre, code') || /^\s*$/.test(node.data)) continue;
++                const fragment = document.createDocumentFragment();
++                for (const segment of new Intl.Segmenter('en-US', { granularity: 'word' }).segment(node.data)) {
++                    const span = document.createElement('span');
++                    span.className = 'text_segment';
++                    span.innerText = segment.segment;
++                    fragment.appendChild(span);
++                }
++                node.replaceWith(fragment);
++            }
++            morphdom(expected, target);
++            applyStreamFadeIn(actual, inputs[index]);
++            if (index === 0) stableNode = actual.querySelector('#stable');
++            if (index === 1) stablePreserved = actual.querySelector('#stable') === stableNode;
++            const formState = element => [...element.querySelectorAll('input, textarea, select')].map(node => ({ value: node.value, checked: node.checked, selectedIndex: node.selectedIndex }));
++            snapshots.push({ actual: actual.outerHTML, expected: expected.outerHTML, actualForm: formState(actual), expectedForm: formState(expected) });
++            if (index === 4) {
++                for (const element of [expected, actual]) {
++                    element.querySelector('input').value = 'user change';
++                    element.querySelector('input[type="checkbox"]').checked = true;
++                    element.querySelector('textarea').value = 'user change';
++                    element.querySelector('select').selectedIndex = 1;
++                }
++            }
++            // External DOM changes must still be reconciled on the next update.
++            if (index === 1) {
++                expected.querySelector('#stable').setAttribute('data-external', 'changed');
++                actual.querySelector('#stable').setAttribute('data-external', 'changed');
++            }
++        }
++        return { snapshots, stablePreserved };
++    });
++    expect(result.stablePreserved).toBe(true);
++    for (const snapshot of result.snapshots) {
++        expect(snapshot.actual).toBe(snapshot.expected);
++        expect(snapshot.actualForm).toEqual(snapshot.expectedForm);
++    }
++});
++
++test('cached segments preserve Unicode, whitespace and granularity without sharing mutable nodes', async ({ page }) => {
++    const result = await page.evaluate(async () => {
++        const { segmentTextInElement } = await import('/scripts/util/stream-fadein.js');
++        const text = 'Cache comparison: 👨‍👩‍👧‍👦 e\u0301 日本語。\nSecond\tline < & >!';
++        const snapshots = [];
++        const originalSegment = Intl.Segmenter.prototype.segment;
++        let calls = 0;
++        Intl.Segmenter.prototype.segment = function (...args) {
++            calls++;
++            return originalSegment.apply(this, args);
++        };
++        try {
++            for (const granularity of ['word', 'grapheme', 'sentence']) {
++                const source = document.createElement('div');
++                source.textContent = text;
++                const first = document.createElement('div');
++                const second = document.createElement('div');
++                segmentTextInElement(first, source.innerHTML, granularity);
++                const expected = first.innerHTML;
++                const afterFirst = calls;
++                first.firstElementChild.textContent = 'Mutated by an extension';
++                first.firstElementChild.className = 'changed';
++                segmentTextInElement(second, source.innerHTML, granularity);
++                snapshots.push({ expected, actual: second.innerHTML, cached: calls === afterFirst });
++            }
++            const firstText = '<p>Old cache entry retained only within the bound.</p>';
++            segmentTextInElement(document.createElement('div'), firstText);
++            for (let index = 0; index < 130; index++) {
++                segmentTextInElement(document.createElement('div'), `<p>Unique cache entry ${index}.</p>`);
++            }
++            const beforeEvicted = calls;
++            segmentTextInElement(document.createElement('div'), firstText);
++            return { snapshots, evicted: calls > beforeEvicted };
++        } finally {
++            Intl.Segmenter.prototype.segment = originalSegment;
++        }
++    });
++    expect(result.evicted).toBe(true);
++    for (const snapshot of result.snapshots) {
++        expect(snapshot.actual).toBe(snapshot.expected);
++        expect(snapshot.cached).toBe(true);
++    }
++});
++
++test('fade updates still apply fresh formatter hooks and sanitization and support browsers without Segmenter', async ({ page }) => {
++    const result = await page.evaluate(async () => {
++        const { applyStreamFadeIn, segmentTextInElement } = await import('/scripts/util/stream-fadein.js');
++        const { messageFormatting } = await import('/script.js');
++        const { MessageFormatter } = await import('/scripts/message-formatter.js');
++        const target = document.createElement('div');
++        let hookRuns = 0;
++        MessageFormatter.addHook(html => `${html}<span data-tick="${++hookRuns}">Tick ${hookRuns}</span><img src="x" onerror="window.unsafeFade=true">`);
++        for (const text of ['Growing **answer**', 'Growing **answer** continues', 'Growing **answer** continues']) {
++            applyStreamFadeIn(target, messageFormatting(text, 'Assistant', false, false, -1));
++        }
++        const final = { hookRuns, tick: target.querySelector('[data-tick]')?.getAttribute('data-tick'), unsafe: !!target.querySelector('[onerror]'), bold: target.querySelector('strong')?.textContent };
++        const nativeSegmenter = Intl.Segmenter;
++        try {
++            Intl.Segmenter = undefined;
++            const fallback = document.createElement('div');
++            segmentTextInElement(fallback, '<p>Plain fallback <code>x &lt; y</code></p>');
++            return { ...final, fallback: fallback.innerHTML };
++        } finally {
++            Intl.Segmenter = nativeSegmenter;
++        }
++    });
++    expect(result).toEqual({ hookRuns: 3, tick: '3', unsafe: false, bold: 'answer', fallback: '<p>Plain fallback <code>x &lt; y</code></p>' });
++});
+diff --git a/tests/showdown-patch.node.mjs b/tests/showdown-patch.node.mjs
+new file mode 100644
+index 00000000..f32490ec
+--- /dev/null
++++ b/tests/showdown-patch.node.mjs
+@@ -0,0 +1,143 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++import showdown from 'showdown';
++import { addShowdownPatch } from '../public/scripts/util/showdown-patch.js';
++
++// Preserve the previous parser as a compatibility oracle, including its unusual
++// first-occurrence and String.replace replacement-string behavior.
++function originalUnhash(text, options, globals) {
++    text = globals.converter._dispatch('unhashHTMLSpans.before', text, options, globals);
++    for (let i = 0; i < globals.gHtmlSpans.length; i++) {
++        let repText = globals.gHtmlSpans[i];
++        let limit = 0;
++        while (/¨C(\d+)C/.test(repText)) {
++            const num = RegExp.$1;
++            repText = repText.replace('¨C' + num + 'C', globals.gHtmlSpans[num]);
++            if (limit === 10000) {
++                console.error('maximum nesting of 10000 spans reached!!!');
++                break;
++            }
++            limit++;
++        }
++        text = text.replace('¨C' + i + 'C', repText);
++    }
++    return globals.converter._dispatch('unhashHTMLSpans.after', text, options, globals);
++}
++
++let optimizedUnhash;
++addShowdownPatch({ subParser: (_name, callback) => { optimizedUnhash = callback; } });
++
++function run(parser, text, spans, dispatch = (_event, value) => value) {
++    const calls = [];
++    const globals = {
++        gHtmlSpans: Object.assign(spans.slice(), spans),
++        converter: { _dispatch(event, value, options, state) {
++            calls.push({ event, text: value, options });
++            return dispatch(event, value, options, state, parser);
++        } },
++    };
++    const html = parser(text, { testOption: true }, globals);
++    return { html, calls };
++}
++
++test('span expansion matches ordered replacement for nested, duplicated and literal tokens', () => {
++    const cases = [
++        ['before ¨C0C after ¨C1C', ['<q>dialogue</q>', '<code>x &lt; y</code>']],
++        ['¨C0C ¨C0C ¨C1C', ['<i>first</i>', '<b>second</b>']],
++        ['¨C00C ¨C01C ¨C99C ¨C-1C ¨C0C ¨C90071992547409930C', ['<q>valid</q>']],
++        ['¨C2C ¨C1C ¨C0C', ['<em>inner</em>', '<b>¨C0C + ¨C0C</b>', '<a>¨C1C</a>']],
++        ['¨C0C', ['<q>Missing ¨C99C reference</q>']],
++        ['¨C0C', ['<q>Leading zero ¨C01C</q>', '<b>other</b>']],
++        ['plain ¨C0C', []],
++        ['¨C0C / ¨C1C / ¨C2C', [undefined, null, 42]],
++        ['¨C0C1C', ['¨C', '<em>assembled token</em>']],
++        ['¨C¨C0C', ['1C', '<em>assembled token</em>']],
++        ['before ¨C0C middle ¨C1C after', ['<q>$&</q>', '<b>$$</b>']],
++        ['before ¨C0C middle ¨C1C after', ['<q>$`</q>', "<b>$'</b>"]],
++        ['¨C1C', ['<q>$&</q>', '<b>¨C0C</b>']],
++        ['¨C0C ¨C1C', ['<q>$1 and $0 stay literal</q>', '<b>cost $5</b>']],
++        ['¨C0C', Object.assign(['<q>¨C01C</q>'], { '01': '$$&' })],
++        ['¨C0C', Object.assign(['<q>¨C01C</q>'], { '01': "$$'" })],
++        ['¨C0C', Object.assign(['<q>¨C01C</q>'], { '01': '$$`' })],
++    ];
++    for (const [text, spans] of cases) {
++        assert.deepEqual(run(optimizedUnhash, text, spans), run(originalUnhash, text, spans), text);
++    }
++});
++
++test('extension dispatch may rewrite text and spans and invoke the parser reentrantly', () => {
++    function dispatch(event, text, _options, globals, parser) {
++        if (event.endsWith('.before')) {
++            const nested = run(parser, '¨C0C', ['<em>nested dispatch</em>']).html;
++            globals.gHtmlSpans[0] = `<q>${nested}</q>`;
++            globals.gHtmlSpans.push('<strong>added by listener</strong>');
++            return text + ' ¨C1C';
++        }
++        return text + '<!-- after -->';
++    }
++    assert.deepEqual(run(optimizedUnhash, '¨C0C', ['<q>original</q>'], dispatch), run(originalUnhash, '¨C0C', ['<q>original</q>'], dispatch));
++    const replaceSpanTable = (event, text, _options, globals) => {
++        if (event.endsWith('.before')) globals.gHtmlSpans = { 0: '<q>array-like table</q>', length: 1 };
++        return text;
++    };
++    assert.deepEqual(run(optimizedUnhash, '¨C0C', [], replaceSpanTable), run(originalUnhash, '¨C0C', [], replaceSpanTable));
++});
++
++test('cyclic references retain the previous nesting limit and diagnostic', () => {
++    const previousError = console.error;
++    const errors = [];
++    console.error = (...args) => errors.push(args);
++    try {
++        const expected = run(originalUnhash, '¨C0C', ['¨C0C']);
++        const beforeOptimized = errors.slice();
++        errors.length = 0;
++        assert.deepEqual(run(optimizedUnhash, '¨C0C', ['¨C0C']), expected);
++        assert.deepEqual(errors, beforeOptimized);
++        assert.equal(errors.length, 1);
++    } finally {
++        console.error = previousError;
++    }
++});
++
++test('deterministic nested span combinations match the previous parser exactly', () => {
++    let seed = 12345;
++    const random = max => {
++        seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
++        return seed % max;
++    };
++    for (let iteration = 0; iteration < 250; iteration++) {
++        const spans = ['<code>start &lt; end</code>'];
++        for (let index = 1; index < 8; index++) {
++            const inner = random(2) ? `¨C${random(index)}C` : `literal ${iteration}-${index}`;
++            spans.push(`<span data-index="${index}">${inner}</span>`);
++        }
++        const text = Array.from({ length: 15 }, () => `¨C${random(12)}C`).join(' / ');
++        assert.equal(run(optimizedUnhash, text, spans).html, run(originalUnhash, text, spans).html);
++    }
++});
++
++test('actual Showdown output stays identical across growing Markdown and inline HTML', () => {
++    const fragments = [
++        '# Heading\n\n', '**Bold** _emphasis_ ~~strike~~ and `code`\n\n',
++        '<q>"Dialogue with $5 and $& symbols"</q>\n\n',
++        '<span title="quoted attribute">Outer <em>inner</em></span>\n\n',
++        '| column | another |\n| --- | --- |\n| <b>A</b> | B |\n\n',
++        '- first\n- <code>second</code>\n\n',
++        '```js\nconst token = "¨C0C";\n```\n\n',
++        '日本語 👩🏽‍💻 &amp; <https://example.com>\n\n',
++        '<!-- comment --> <br> text <img src="x" alt="picture">\n\n',
++    ];
++    const converter = new showdown.Converter({ tables: true, strikethrough: true, simpleLineBreaks: true });
++    try {
++        let text = '';
++        for (let index = 0; index < 45; index++) {
++            text += fragments[index % fragments.length];
++            showdown.subParser('unhashHTMLSpans', originalUnhash);
++            const expected = converter.makeHtml(text);
++            showdown.subParser('unhashHTMLSpans', optimizedUnhash);
++            assert.equal(converter.makeHtml(text), expected, `prefix ${index}`);
++        }
++    } finally {
++        addShowdownPatch(showdown);
++    }
++});

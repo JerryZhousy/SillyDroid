@@ -1,0 +1,192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Thu, 22 Oct 2026 18:15:06 +0900
+Subject: [PATCH 06/31] Prevent repeated reasoning edits from corrupting saved
+ text
+
+---
+ public/scripts/reasoning.js                 | 37 ++++++++++-----
+ tests/frontend/ReasoningHiddenBlocks.e2e.js | 52 +++++++++++++++++++++
+ 2 files changed, 78 insertions(+), 11 deletions(-)
+
+diff --git a/public/scripts/reasoning.js b/public/scripts/reasoning.js
+index 86551428..5a000b10 100644
+--- a/public/scripts/reasoning.js
++++ b/public/scripts/reasoning.js
+@@ -50,6 +50,8 @@ const UI = {
+     $maxAdditions: $('#reasoning_max_additions'),
+ };
+ 
++let reasoningInitialized = false;
++
+ /**
+  * Enum representing the type of the reasoning for a message (where it came from)
+  * @readonly
+@@ -805,57 +807,58 @@ export class PromptReasoning {
+ 
+ function loadReasoningSettings() {
+     UI.$addToPrompts.prop('checked', power_user.reasoning.add_to_prompts);
++    UI.$prefix.val(power_user.reasoning.prefix);
++    UI.$suffix.val(power_user.reasoning.suffix);
++    UI.$separator.val(power_user.reasoning.separator);
++    UI.$maxAdditions.val(power_user.reasoning.max_additions);
++    UI.$autoParse.prop('checked', power_user.reasoning.auto_parse);
++    UI.$autoExpand.prop('checked', power_user.reasoning.auto_expand);
++    UI.$showHidden.prop('checked', power_user.reasoning.show_hidden);
++    toggleReasoningAutoExpand();
++    $('#chat').attr('data-show-hidden-reasoning', power_user.reasoning.show_hidden ? 'true' : null);
++}
++
++function setReasoningSettingsHandlers() {
+     UI.$addToPrompts.on('change', function () {
+         power_user.reasoning.add_to_prompts = !!$(this).prop('checked');
+         saveSettingsDebounced();
+     });
+ 
+-    UI.$prefix.val(power_user.reasoning.prefix);
+     UI.$prefix.on('input', function () {
+         power_user.reasoning.prefix = String($(this).val());
+         saveSettingsDebounced();
+     });
+ 
+-    UI.$suffix.val(power_user.reasoning.suffix);
+     UI.$suffix.on('input', function () {
+         power_user.reasoning.suffix = String($(this).val());
+         saveSettingsDebounced();
+     });
+ 
+-    UI.$separator.val(power_user.reasoning.separator);
+     UI.$separator.on('input', function () {
+         power_user.reasoning.separator = String($(this).val());
+         saveSettingsDebounced();
+     });
+ 
+-    UI.$maxAdditions.val(power_user.reasoning.max_additions);
+     UI.$maxAdditions.on('input', function () {
+         power_user.reasoning.max_additions = Number($(this).val());
+         saveSettingsDebounced();
+     });
+ 
+-    UI.$autoParse.prop('checked', power_user.reasoning.auto_parse);
+     UI.$autoParse.on('change', function () {
+         power_user.reasoning.auto_parse = !!$(this).prop('checked');
+         saveSettingsDebounced();
+     });
+ 
+-    UI.$autoExpand.prop('checked', power_user.reasoning.auto_expand);
+     UI.$autoExpand.on('change', function () {
+         power_user.reasoning.auto_expand = !!$(this).prop('checked');
+         toggleReasoningAutoExpand();
+         saveSettingsDebounced();
+     });
+-    toggleReasoningAutoExpand();
+-
+-    UI.$showHidden.prop('checked', power_user.reasoning.show_hidden);
+     UI.$showHidden.on('change', function () {
+         power_user.reasoning.show_hidden = !!$(this).prop('checked');
+         $('#chat').attr('data-show-hidden-reasoning', power_user.reasoning.show_hidden ? 'true' : null);
+         saveSettingsDebounced();
+     });
+-    $('#chat').attr('data-show-hidden-reasoning', power_user.reasoning.show_hidden ? 'true' : null);
+-
+     UI.$select.on('change', async function () {
+         const name = String($(this).val());
+         const template = reasoning_templates.find(p => p.name === name);
+@@ -1314,6 +1317,9 @@ function setReasoningEventHandlers() {
+         }
+ 
+         const textarea = messageBlock.find('.reasoning_edit_textarea');
++        if (textarea.length === 0) {
++            return;
++        }
+         let newReasoning = String(textarea.val());
+         newReasoning = substituteParams(newReasoning);
+         textarea.remove();
+@@ -1336,6 +1342,9 @@ function setReasoningEventHandlers() {
+ 
+         const { messageBlock } = getMessageFromJquery(this);
+         const textarea = messageBlock.find('.reasoning_edit_textarea');
++        if (textarea.length === 0) {
++            return;
++        }
+         textarea.remove();
+ 
+         messageBlock.find('.mes_reasoning_edit_cancel:visible').trigger('click');
+@@ -1700,8 +1709,14 @@ export async function loadReasoningTemplates(data) {
+  */
+ export function initReasoning() {
+     loadReasoningSettings();
++    if (reasoningInitialized) {
++        return;
++    }
++
++    setReasoningSettingsHandlers();
+     setReasoningEventHandlers();
+     registerReasoningSlashCommands();
+     registerReasoningMacros();
+     registerReasoningAppEvents();
++    reasoningInitialized = true;
+ }
+diff --git a/tests/frontend/ReasoningHiddenBlocks.e2e.js b/tests/frontend/ReasoningHiddenBlocks.e2e.js
+index 7de32ca6..2d855631 100644
+--- a/tests/frontend/ReasoningHiddenBlocks.e2e.js
++++ b/tests/frontend/ReasoningHiddenBlocks.e2e.js
+@@ -703,6 +703,58 @@ test.describe('Reasoning hidden blocks', () => {
+         expect(result.reasoningText).toContain('visible reasoning');
+     });
+ 
++    test('saves reasoning once after repeated initialization and ignores stale done actions', async ({ page }) => {
++        let saveCount = 0;
++        await page.route('**/api/chats/save', async (route) => {
++            saveCount++;
++            await route.fulfill({ json: { result: 'ok' } });
++        });
++
++        const result = await page.evaluate(async (messageHtml) => {
++            const [reasoningModule, scriptModule] = await Promise.all([
++                import('/scripts/reasoning.js'),
++                import('/script.js'),
++            ]);
++            reasoningModule.initReasoning();
++            reasoningModule.initReasoning();
++
++            const context = window.SillyTavern.getContext();
++            scriptModule.setCharacterId(context.characters.push({
++                name: 'Reasoning E2E', avatar: 'reasoning-e2e.png', chat: 'Reasoning E2E',
++            }) - 1);
++            context.chat.length = 0;
++            context.chat.push({ extra: { reasoning: 'original reasoning' }, name: 'Ilo', mes: 'Foo' });
++            const chat = document.getElementById('chat');
++            chat.innerHTML = messageHtml;
++
++            let editedEvents = 0;
++            context.eventSource.on(context.eventTypes.MESSAGE_REASONING_EDITED, () => editedEvents++);
++            const edited = new Promise(resolve => context.eventSource.once(context.eventTypes.MESSAGE_REASONING_EDITED, resolve));
++            chat.querySelector('.mes_reasoning_edit').click();
++            chat.querySelector('.reasoning_edit_textarea').value = 'saved reasoning';
++            const done = chat.querySelector('.mes_reasoning_edit_done');
++            done.click();
++            done.click();
++            await edited;
++            // A stale action after saving must also leave the stored value untouched.
++            done.click();
++            await new Promise(resolve => setTimeout(resolve, 100));
++
++            return {
++                reasoningValue: context.chat[0].extra.reasoning,
++                reasoningText: chat.querySelector('.mes_reasoning').textContent,
++                textareaCount: chat.querySelectorAll('.reasoning_edit_textarea').length,
++                editedEvents,
++            };
++        }, createEditableReasoningMessageHtml({ detailsAttributes: 'data-has-content="true" open', includeMessageContainers: true }));
++
++        expect(result.reasoningValue).toBe('saved reasoning');
++        expect(result.reasoningText).toContain('saved reasoning');
++        expect(result.textareaCount).toBe(0);
++        expect(result.editedEvents).toBe(1);
++        expect(saveCount).toBe(1);
++    });
++
+     test('collapses reasoning after changing whitespace-only reasoning to different whitespace', async ({ page }) => {
+         const result = await page.evaluate(async (messageHtml) => {
+             const reasoningModule = await import('/scripts/reasoning.js');

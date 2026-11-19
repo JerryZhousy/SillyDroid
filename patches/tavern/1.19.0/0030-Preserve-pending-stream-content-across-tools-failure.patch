@@ -1,0 +1,466 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Thu, 22 Oct 2026 21:50:41 +0900
+Subject: [PATCH 30/31] Preserve pending stream content across tools, failures,
+ and user stops
+
+---
+ README.md                                  |   4 +-
+ public/script.js                           |  20 ++-
+ tests/frontend/ShortStreamingTools.e2e.js  | 121 +++++++++++++++++
+ tests/frontend/StreamingControlFlow.e2e.js | 143 +++++++++++++++++++++
+ tests/frontend/StreamingFailure.e2e.js     |  91 +++++++++++++
+ 5 files changed, 375 insertions(+), 4 deletions(-)
+ create mode 100644 tests/frontend/ShortStreamingTools.e2e.js
+ create mode 100644 tests/frontend/StreamingControlFlow.e2e.js
+ create mode 100644 tests/frontend/StreamingFailure.e2e.js
+
+diff --git a/README.md b/README.md
+index 5047e5c2..836c92b8 100644
+--- a/README.md
++++ b/README.md
+@@ -32,7 +32,7 @@ Scripts can use `/model exact=true your-model-id` for an exact selection; the de
+ - Failed token-count requests settle through the existing fallback instead of leaving asynchronous callers waiting forever after an HTTP/network error. Empty responses also use the fallback, with the existing retry limit preserved.
+ - Concurrent requests for the same tokenizer share one pending model initialization and receive an instance only after it is ready. Failed loads can be retried by a later request; encoding uses one consistent instance for token IDs, counts, and chunks. Different models can still initialize independently.
+ - Token counts load and persist per chat. A small LRU retains up to four resident chat buckets when operations are idle, with in-flight consumers temporarily retained until safe to release; writes made during persistence remain dirty. Deletion/reset cannot resurrect pending counts, and connection parameters are captured before asynchronous cache loads. The old monolithic token-count cache is discarded without parsing it; counts are recomputed as needed, and chat messages are untouched.
+-- Hidden tabs limit expensive streaming previews to four per second (or the user's slower setting), while receiving every chunk and emitting every token event. Returning to the foreground restores the configured rate, and completion always renders the final message.
++- Hidden tabs limit expensive streaming previews to four per second (or the user's slower setting), while receiving every chunk and emitting every token event. Returning to the foreground restores the configured rate, and completion always renders the final message. Short tool-call streams retain reasoning before their first preview, and interrupted streams flush pending text through the existing error path.
+ - Loading very large chats avoids JavaScript's function-argument limit while preserving the shared chat array and message order. Group, character, neutral-chat, and clipboard-history replacement use the same helper.
+ - PNG/WebP animation probes read at most the same 200-byte header examined by the existing detectors. Static thumbnail generation no longer reads an entire original twice just to check its animation flag.
+ - Six independent startup message templates download concurrently, while message construction, settings initialization, and extension activation keep their existing order.
+@@ -158,7 +158,7 @@ The [TauriTavern reference revision](https://github.com/Darkatse/TauriTavern/tre
+ 
+ Token-cache timings are medians of seven alternating runs in real Chromium IndexedDB with warm storage and OS caches. The old serialized fixture is 8.34 MB; the active chat is 13.8 kB. The comparison measures cache reads/writes, excluding fixture preparation and the rest of application startup. Cache tests cover pending-load merges, switching chats or connections during a count, dirty writes during eviction, deletion/reset, storage failure, and bounded residency. The one-time legacy-cache removal trades previously calculated counts for avoiding a full historical-cache migration.
+ 
+-Streaming tests use the actual processor and Markdown/DOM path with a deterministic chunk clock and simulated tab visibility. The timing comparison runs baseline/current/current/baseline in a separate idle window; foreground preview counts remain 125 and execution times are similar. Every chunk, token event, final message, reasoning field, tool call, and final flush is checked; these numbers do not measure provider throughput. A 200,000-message neutral-chat restore also verifies the shared array's identity and every message's position.
++Streaming tests use the actual processor and Markdown/DOM path with a deterministic chunk clock and simulated tab visibility. The timing comparison runs baseline/current/current/baseline in a separate idle window; foreground preview counts remain 125 and execution times are similar. Every chunk, token event, final message, reasoning field, tool call, and final flush is checked; these numbers do not measure provider throughput. Additional regressions exercise real generation and tool invocation for short reasoning-only streams, plus connection and renderer failures without repeated completion events. A 200,000-message neutral-chat restore also verifies the shared array's identity and every message's position.
+ 
+ Thumbnail I/O counts are measured separately from timing; five alternating rounds compare identical output hashes. The images use one-pixel PNGs with large ancillary chunks and synthetic animated WebP headers, so they demonstrate reduced reads rather than a general high-resolution decoding speedup. Template results use baseline/current/current/baseline with real HTML, injected response delay, and identical message data; they measure only template initialization. These comparisons use `46c47c5b0` target modules with current supporting code, except the token-cache benchmark, which directly reproduces the old whole-object storage operations.
+ 
+diff --git a/public/script.js b/public/script.js
+index 6654e451..5095394f 100644
+--- a/public/script.js
++++ b/public/script.js
+@@ -3920,6 +3920,7 @@ class StreamingProcessor {
+         const isContinue = this.type == 'continue';
+         this.stoppingStrings = getStoppingStrings(isImpersonate, isContinue, main_api);
+ 
++        let pendingPreview = false;
+         try {
+             const configuredFps = normalizeStreamingFps(power_user.streaming_fps);
+             const sw = new Stopwatch(getStreamingRenderInterval({ configuredFps, hidden: document.hidden }));
+@@ -3944,9 +3945,14 @@ class StreamingProcessor {
+                 this.reasoningHandler.updateReasoning(this.messageId, state?.reasoning);
+                 this.images = state?.images ?? [];
+                 this.reasoningSignature = state?.signature ?? null;
++                pendingPreview = true;
+                 await eventSource.emit(event_types.STREAM_TOKEN_RECEIVED, text);
+                 sw.interval = getStreamingRenderInterval({ configuredFps, hidden: document.hidden });
+-                await sw.tick(async () => await this.onProgressStreaming(this.messageId, this.continueMessage + text));
++                await sw.tick(async () => {
++                    // A failing renderer must not be retried by the error cleanup below.
++                    pendingPreview = false;
++                    await this.onProgressStreaming(this.messageId, this.continueMessage + text);
++                });
+             }
+             const seconds = (timestamps[timestamps.length - 1] - timestamps[0]) / 1000;
+             console.warn(`Stream stats: ${timestamps.length} tokens, ${seconds.toFixed(2)} seconds, rate: ${Number(timestamps.length / seconds).toFixed(2)} TPS`);
+@@ -3954,6 +3960,14 @@ class StreamingProcessor {
+             // in the case of a self-inflicted abort, we have already cleaned up
+             if (!this.isFinished) {
+                 console.error(err);
++                if (pendingPreview) {
++                    try {
++                        pendingPreview = false;
++                        await this.onProgressStreaming(this.messageId, this.continueMessage + this.result);
++                    } catch (previewError) {
++                        console.error('Failed to render the last received stream content:', previewError);
++                    }
++                }
+                 this.onErrorStreaming();
+             }
+             return this.result;
+@@ -5463,7 +5477,9 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
+             if (canPerformToolCalls && isStreamFinished && isStreamWithToolCalls) {
+                 const lastMessage = chat[chat.length - 1];
+                 const hasToolCalls = ToolManager.hasToolCalls(streamingProcessor.toolCalls);
+-                const shouldDeleteMessage = type !== 'swipe' && ['', '...'].includes(lastMessage?.mes) && !lastMessage?.extra?.reasoning && ['', '...'].includes(streamingProcessor?.result);
++                // Hidden-tab previews can lag behind the reasoning collected from every chunk.
++                const hasReasoning = lastMessage?.extra?.reasoning || streamingProcessor.reasoningHandler.reasoning;
++                const shouldDeleteMessage = type !== 'swipe' && ['', '...'].includes(lastMessage?.mes) && !hasReasoning && ['', '...'].includes(streamingProcessor?.result);
+                 hasToolCalls && shouldDeleteMessage && await deleteLastMessage();
+                 if (hasToolCalls && !shouldDeleteMessage) {
+                     await streamingProcessor.finalizeIntermediaryMessage(streamingProcessor.messageId, getMessage, { unlockUI: false });
+diff --git a/tests/frontend/ShortStreamingTools.e2e.js b/tests/frontend/ShortStreamingTools.e2e.js
+new file mode 100644
+index 00000000..fd82cd3b
+--- /dev/null
++++ b/tests/frontend/ShortStreamingTools.e2e.js
+@@ -0,0 +1,121 @@
++import { test, expect } from '@playwright/test';
++import { setupStreamingFixture } from '../util/streaming-fixture.mjs';
++
++test.beforeEach(async ({ page }) => {
++    await page.route('**/api/chats/save', route => route.fulfill({ json: { result: 'ok' } }));
++    await page.route('**/api/backends/chat-completions/status', route => route.fulfill({ json: { data: [] } }));
++    await page.route('**/api/tokenizers/**', route => route.fulfill({ json: { count: 8, token_count: 8, ids: [1, 2, 3] } }));
++    await setupStreamingFixture(page, { baseline: process.env.ST_SHORT_STREAM_BASELINE });
++});
++
++for (const scenario of [
++    { name: 'stealth tool preserves short-stream reasoning before stopping', stealth: true, reasoning: 'Reasoning before the stealth tool.' },
++    { name: 'ordinary tool preserves short-stream reasoning before the follow-up reply', stealth: false, reasoning: 'Reasoning before the ordinary tool.' },
++    { name: 'a truly empty stealth-tool placeholder is still removed', stealth: true, reasoning: '' },
++]) {
++    const expectedMessages = [
++        ...(scenario.reasoning ? [{ text: '', reasoning: scenario.reasoning, domReasoning: scenario.reasoning }] : []),
++        ...(!scenario.stealth ? [{ text: 'Answer after the tool.', reasoning: '', domReasoning: '' }] : []),
++    ];
++    test(`${scenario.name}`, async ({ page }) => {
++        test.setTimeout(60000);
++        const result = await page.evaluate(async ({ stealth, reasoning }) => {
++            const st = await import('/script.js');
++            const { oai_settings } = await import('/scripts/openai.js');
++            const { power_user } = await import('/scripts/power-user.js');
++            const { ToolManager } = await import('/scripts/tool-calling.js');
++            await st.newAssistantChat({ temporary: true });
++            st.changeMainAPI('openai');
++            Object.assign(oai_settings, {
++                chat_completion_source: 'custom', custom_url: 'https://example.invalid', custom_model: 'short-tool-stream-test',
++                stream_openai: true, function_calling: true, show_thoughts: true, custom_prompt_post_processing: '',
++            });
++            Object.assign(power_user, { streaming_fps: 30, stream_fade_in: false, message_token_count_enabled: false });
++            st.setOnlineStatus('short-tool-stream-test');
++            const userMessage = { name: 'User', is_user: true, is_system: false, mes: 'Use the registered tool.', extra: {} };
++            st.chat.push(userMessage);
++            await st.addOneMessage(userMessage);
++
++            const originalFetch = window.fetch;
++            const originalNow = Date.now;
++            const hiddenDescriptor = Object.getOwnPropertyDescriptor(document, 'hidden');
++            const progress = st.StreamingProcessor.prototype.onProgressStreaming;
++            const toolName = 'short_stream_reasoning_probe';
++            let virtualNow = Date.now();
++            let toolCalls = 0;
++            const requests = [];
++            const previews = [];
++            const events = { tokens: [], received: [], rendered: [], reasoningDone: [], deleted: [] };
++            const handlers = [
++                [st.event_types.STREAM_TOKEN_RECEIVED, text => { virtualNow += 100; events.tokens.push(text); }],
++                [st.event_types.MESSAGE_RECEIVED, id => events.received.push(id)],
++                [st.event_types.CHARACTER_MESSAGE_RENDERED, id => events.rendered.push(id)],
++                [st.event_types.STREAM_REASONING_DONE, (text, duration, id) => events.reasoningDone.push({ text, duration, id })],
++                [st.event_types.MESSAGE_DELETED, id => events.deleted.push(id)],
++            ];
++            for (const [event, handler] of handlers) st.eventSource.on(event, handler);
++            ToolManager.registerFunctionTool({
++                name: toolName, displayName: 'Short stream regression tool', description: 'A deterministic test tool.',
++                parameters: { type: 'object', properties: {} }, stealth,
++                action: () => { toolCalls++; return 'Tool completed.'; },
++            });
++            st.StreamingProcessor.prototype.onProgressStreaming = async function (id, text, final) {
++                previews.push({ id, final: Boolean(final) });
++                return progress.call(this, id, text, final);
++            };
++            window.fetch = (url, options) => {
++                if (url !== '/api/backends/chat-completions/generate') return originalFetch(url, options);
++                requests.push(JSON.parse(options.body));
++                if (requests.length > 2) throw new Error('Unexpected repeated tool generation');
++                const delta = requests.length === 1 ? {
++                    content: '', reasoning_content: reasoning,
++                    tool_calls: [{ index: 0, id: 'short-tool-call', type: 'function', function: { name: toolName, arguments: '{}' } }],
++                } : { content: 'Answer after the tool.' };
++                const body = `data: ${JSON.stringify({ choices: [{ index: 0, delta }] })}\n\ndata: [DONE]\n\n`;
++                return Promise.resolve(new Response(body, { headers: { 'Content-Type': 'text/event-stream' } }));
++            };
++            try {
++                Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
++                // Each real SSE delta advances the processor's clock by 100 ms:
++                // long enough for a foreground preview, below the hidden cap.
++                Date.now = () => virtualNow;
++                await st.Generate('normal', { automatic_trigger: true });
++                const assistantMessages = st.chat.map((message, id) => ({ message, id }))
++                    .filter(({ message }) => !message.is_user && !message.is_system)
++                    .map(({ message, id }) => ({ id, text: message.mes, reasoning: message.extra?.reasoning ?? '', domReasoning: document.querySelector(`#chat .mes[mesid="${id}"] .mes_reasoning`)?.textContent ?? '' }));
++                return {
++                    assistantMessages, previews, events, toolCalls,
++                    requestCount: requests.length,
++                    registeredInRequest: requests[0]?.tools?.some(tool => tool.function?.name === toolName),
++                    invocationCount: st.chat.flatMap(message => message.extra?.tool_invocations ?? []).length,
++                    streamingStopped: st.streamingProcessor === null,
++                };
++            } finally {
++                Date.now = originalNow;
++                window.fetch = originalFetch;
++                st.StreamingProcessor.prototype.onProgressStreaming = progress;
++                if (hiddenDescriptor) Object.defineProperty(document, 'hidden', hiddenDescriptor);
++                else delete document.hidden;
++                for (const [event, handler] of handlers) st.eventSource.removeListener(event, handler);
++                ToolManager.unregisterFunctionTool(toolName);
++            }
++        }, scenario);
++
++        expect(result.toolCalls).toBe(1);
++        expect(result.registeredInRequest).toBe(true);
++        expect(result.requestCount).toBe(scenario.stealth ? 1 : 2);
++        expect(result.invocationCount).toBe(scenario.stealth ? 0 : 1);
++        expect(result.streamingStopped).toBe(true);
++        expect(result.previews.filter(preview => !preview.final)).toEqual([]);
++        expect(result.events.tokens).toEqual(scenario.stealth ? [''] : ['', 'Answer after the tool.']);
++        expect(result.assistantMessages.map(({ text, reasoning, domReasoning }) => ({ text, reasoning, domReasoning }))).toEqual(expectedMessages);
++        expect(result.events.deleted).toHaveLength(scenario.reasoning ? 0 : 1);
++        expect(result.events.reasoningDone).toEqual(scenario.reasoning
++            ? [expect.objectContaining({ text: scenario.reasoning, id: result.assistantMessages[0]?.id })]
++            : []);
++        const ids = result.assistantMessages.map(message => message.id);
++        expect(result.events.received).toEqual(ids);
++        expect(result.events.rendered).toEqual(ids);
++        expect(result.previews).toEqual(ids.map(id => ({ id, final: true })));
++    });
++}
+diff --git a/tests/frontend/StreamingControlFlow.e2e.js b/tests/frontend/StreamingControlFlow.e2e.js
+new file mode 100644
+index 00000000..e692aa3b
+--- /dev/null
++++ b/tests/frontend/StreamingControlFlow.e2e.js
+@@ -0,0 +1,143 @@
++import { test, expect } from '@playwright/test';
++import { setupStreamingFixture } from '../util/streaming-fixture.mjs';
++
++test.beforeEach(async ({ page }) => {
++    await page.route('**/api/chats/save', route => route.fulfill({ json: { result: 'ok' } }));
++    await page.route('**/api/backends/chat-completions/status', route => route.fulfill({ json: { data: [] } }));
++    await page.route('**/api/tokenizers/**', route => route.fulfill({ json: { count: 8, token_count: 8, ids: [1, 2, 3] } }));
++    await setupStreamingFixture(page);
++});
++
++for (const type of ['continue', 'impersonate']) {
++    test(`an interrupted ${type} stream preserves its pending content and original event rules`, async ({ page }) => {
++        const result = await page.evaluate(async type => {
++            const st = await import('/script.js');
++            const { power_user } = await import('/scripts/power-user.js');
++            const { PromptReasoning } = await import('/scripts/reasoning.js');
++            const { replaceArrayContents } = await import('/scripts/util/array-contents.js');
++            Object.assign(power_user, { streaming_fps: 30, stream_fade_in: false, message_token_count_enabled: false });
++            st.changeMainAPI('openai');
++            const prefix = 'Existing prefix. ';
++            const message = { name: 'Assistant', mes: prefix, is_user: false, is_system: false, extra: {}, send_date: new Date().toISOString(), swipe_id: 0, swipes: [prefix], swipe_info: [{}] };
++            replaceArrayContents(st.chat, [message]);
++            await st.redisplayChat({ fade: false });
++            const processor = new st.StreamingProcessor(type, false, new Date(), prefix, new PromptReasoning());
++            processor.messageId = 0;
++            const originalNow = Date.now;
++            const hiddenDescriptor = Object.getOwnPropertyDescriptor(document, 'hidden');
++            let time = Date.now();
++            const events = [];
++            const previews = [];
++            const received = id => events.push(['received', id]);
++            const rendered = id => events.push(['rendered', id]);
++            st.eventSource.on(st.event_types.MESSAGE_RECEIVED, received);
++            st.eventSource.on(st.event_types.CHARACTER_MESSAGE_RENDERED, rendered);
++            const progress = processor.onProgressStreaming.bind(processor);
++            processor.onProgressStreaming = async (id, text, final) => {
++                previews.push({ text, final: Boolean(final) });
++                return progress(id, text, final);
++            };
++            processor.generator = async function* () {
++                time += 100;
++                yield { text: '**Partial answer**', swipes: [], toolCalls: [], state: { reasoning: 'Partial reasoning' } };
++                throw new Error('Stream interrupted');
++            };
++            try {
++                Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
++                Date.now = () => time;
++                await processor.generate();
++                await new Promise(resolve => setTimeout(resolve, 0));
++                return { previews, events, text: st.chat[0].mes, swipe: st.chat[0].swipes[0], reasoning: st.chat[0].extra.reasoning, rawReasoning: processor.reasoningHandler.reasoning, input: document.querySelector('#send_textarea').value, stopped: processor.isStopped, aborted: processor.abortController.signal.aborted, finished: processor.isFinished };
++            } finally {
++                Date.now = originalNow;
++                if (hiddenDescriptor) Object.defineProperty(document, 'hidden', hiddenDescriptor);
++                else delete document.hidden;
++                st.eventSource.removeListener(st.event_types.MESSAGE_RECEIVED, received);
++                st.eventSource.removeListener(st.event_types.CHARACTER_MESSAGE_RENDERED, rendered);
++            }
++        }, type);
++        expect(result).toMatchObject({ stopped: true, aborted: true, finished: false, rawReasoning: 'Partial reasoning', events: [] });
++        expect(result.previews).toEqual([{ text: type === 'continue' ? 'Existing prefix. **Partial answer**' : '**Partial answer**', final: false }]);
++        expect(result.text).toBe(type === 'continue' ? 'Existing prefix. **Partial answer**' : 'Existing prefix. ');
++        expect(result.swipe).toBe(result.text);
++        expect(result.reasoning).toBe(type === 'continue' ? 'Partial reasoning' : undefined);
++        expect(result.input).toBe(type === 'impersonate' ? '**Partial answer**' : '');
++    });
++}
++
++test('stopping Generate before its first hidden preview performs one final flush without error completion', async ({ page }) => {
++    test.setTimeout(60000);
++    const result = await page.evaluate(async () => {
++        const st = await import('/script.js');
++        const { oai_settings } = await import('/scripts/openai.js');
++        const { power_user } = await import('/scripts/power-user.js');
++        await st.newAssistantChat({ temporary: true });
++        st.changeMainAPI('openai');
++        Object.assign(oai_settings, { chat_completion_source: 'custom', custom_url: 'https://example.invalid', custom_model: 'stop-stream-test', stream_openai: true, function_calling: false, show_thoughts: true });
++        Object.assign(power_user, { streaming_fps: 30, stream_fade_in: false, message_token_count_enabled: false });
++        st.setOnlineStatus('stop-stream-test');
++        const user = { name: 'User', is_user: true, is_system: false, mes: 'Start a reply.', extra: {} };
++        st.chat.push(user);
++        await st.addOneMessage(user);
++        const originalFetch = window.fetch;
++        const originalNow = Date.now;
++        const hiddenDescriptor = Object.getOwnPropertyDescriptor(document, 'hidden');
++        const progress = st.StreamingProcessor.prototype.onProgressStreaming;
++        const onError = st.StreamingProcessor.prototype.onErrorStreaming;
++        let clock = Date.now();
++        let requests = 0;
++        let stops = 0;
++        let errors = 0;
++        const previews = [];
++        const received = [];
++        const rendered = [];
++        const stopOnToken = () => {
++            clock += 100;
++            stops++;
++            st.streamingProcessor.onStopStreaming();
++        };
++        const receivedListener = id => received.push(id);
++        const renderedListener = id => rendered.push(id);
++        st.eventSource.on(st.event_types.STREAM_TOKEN_RECEIVED, stopOnToken);
++        st.eventSource.on(st.event_types.MESSAGE_RECEIVED, receivedListener);
++        st.eventSource.on(st.event_types.CHARACTER_MESSAGE_RENDERED, renderedListener);
++        st.StreamingProcessor.prototype.onProgressStreaming = async function (id, text, final) {
++            previews.push({ id, final: Boolean(final) });
++            return progress.call(this, id, text, final);
++        };
++        st.StreamingProcessor.prototype.onErrorStreaming = function () { errors++; return onError.call(this); };
++        window.fetch = (url, options) => {
++            if (url !== '/api/backends/chat-completions/generate') return originalFetch(url, options);
++            requests++;
++            const stream = new ReadableStream({
++                start(controller) {
++                    options.signal.addEventListener('abort', () => controller.error(new DOMException('User stopped generation', 'AbortError')), { once: true });
++                    const delta = { choices: [{ index: 0, delta: { content: '**Stopped answer**', reasoning_content: 'Thought before stop' } }] };
++                    controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(delta)}\n\n`));
++                },
++            });
++            return Promise.resolve(new Response(stream, { headers: { 'Content-Type': 'text/event-stream' } }));
++        };
++        try {
++            Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
++            Date.now = () => clock;
++            await st.Generate('normal', { automatic_trigger: true });
++            const last = st.chat.at(-1);
++            return { requests, stops, errors, previews, received, rendered, messageId: st.chat.length - 1, text: last.mes, reasoning: last.extra.reasoning, domText: document.querySelector('#chat .last_mes .mes_text')?.textContent, streamingStopped: st.streamingProcessor === null };
++        } finally {
++            Date.now = originalNow;
++            window.fetch = originalFetch;
++            st.StreamingProcessor.prototype.onProgressStreaming = progress;
++            st.StreamingProcessor.prototype.onErrorStreaming = onError;
++            if (hiddenDescriptor) Object.defineProperty(document, 'hidden', hiddenDescriptor);
++            else delete document.hidden;
++            st.eventSource.removeListener(st.event_types.STREAM_TOKEN_RECEIVED, stopOnToken);
++            st.eventSource.removeListener(st.event_types.MESSAGE_RECEIVED, receivedListener);
++            st.eventSource.removeListener(st.event_types.CHARACTER_MESSAGE_RENDERED, renderedListener);
++        }
++    });
++    expect(result).toMatchObject({ requests: 1, stops: 1, errors: 0, text: '**Stopped answer**', reasoning: 'Thought before stop', domText: 'Stopped answer', streamingStopped: true });
++    expect(result.previews).toEqual([{ id: result.messageId, final: true }]);
++    expect(result.received).toEqual([result.messageId]);
++    expect(result.rendered).toEqual([result.messageId]);
++});
+diff --git a/tests/frontend/StreamingFailure.e2e.js b/tests/frontend/StreamingFailure.e2e.js
+new file mode 100644
+index 00000000..2d44b2a8
+--- /dev/null
++++ b/tests/frontend/StreamingFailure.e2e.js
+@@ -0,0 +1,91 @@
++import { test, expect } from '@playwright/test';
++import { setupStreamingFixture } from '../util/streaming-fixture.mjs';
++
++test.beforeEach(async ({ page }) => {
++    await setupStreamingFixture(page, { baseline: process.env.ST_STREAM_FAILURE_BASELINE });
++});
++
++for (const scenario of [
++    { name: 'an interrupted hidden stream preserves its pending answer and reasoning', elapsed: 100, rendererThrows: false },
++    { name: 'a renderer exception is not retried by the stream error handler', elapsed: 300, rendererThrows: true },
++    { name: 'a failing pending preview still stops generation and emits completion once', elapsed: 100, rendererThrows: true },
++]) {
++    test(`${scenario.name}`, async ({ page }) => {
++        const result = await page.evaluate(async ({ elapsed, rendererThrows }) => {
++            const st = await import('/script.js');
++            const { power_user } = await import('/scripts/power-user.js');
++            const { PromptReasoning } = await import('/scripts/reasoning.js');
++            const { replaceArrayContents } = await import('/scripts/util/array-contents.js');
++            Object.assign(power_user, { streaming_fps: 30, message_token_count_enabled: false, stream_fade_in: false, pin_styles: false });
++            st.changeMainAPI('openai');
++            const message = { name: 'Assistant', mes: '...', is_user: false, is_system: false, send_date: new Date().toISOString(), extra: {}, swipe_id: 0, swipes: ['...'], swipe_info: [] };
++            replaceArrayContents(st.chat, [message]);
++            await st.redisplayChat({ fade: false });
++            const processor = new st.StreamingProcessor('normal', false, new Date(), '', new PromptReasoning());
++            processor.messageId = 0;
++            const originalNow = Date.now;
++            const hiddenDescriptor = Object.getOwnPropertyDescriptor(document, 'hidden');
++            const baseTime = Date.now();
++            let virtualTime = baseTime;
++            let finalizations = 0;
++            let generatorClosed = 0;
++            const previews = [];
++            const events = { tokens: [], received: [], rendered: [] };
++            const handlers = [
++                [st.event_types.STREAM_TOKEN_RECEIVED, text => events.tokens.push(text)],
++                [st.event_types.MESSAGE_RECEIVED, id => events.received.push(id)],
++                [st.event_types.CHARACTER_MESSAGE_RENDERED, id => events.rendered.push(id)],
++            ];
++            for (const [event, handler] of handlers) st.eventSource.on(event, handler);
++            const onProgress = processor.onProgressStreaming.bind(processor);
++            processor.onProgressStreaming = async (id, text, final) => {
++                previews.push({ id, final: Boolean(final) });
++                await onProgress(id, text, final);
++                if (rendererThrows) throw new Error('Renderer failed after the DOM update');
++            };
++            const finalize = processor.finalizeIntermediaryMessage.bind(processor);
++            processor.finalizeIntermediaryMessage = async (...args) => {
++                finalizations++;
++                return finalize(...args);
++            };
++            processor.generator = async function* () {
++                try {
++                    virtualTime = baseTime + elapsed;
++                    yield { text: '**Partial answer**', swipes: [], toolCalls: [], state: { reasoning: 'Partial reasoning' } };
++                    throw new Error('The connection ended before the next token');
++                } finally {
++                    generatorClosed++;
++                }
++            };
++            try {
++                Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
++                Date.now = () => virtualTime;
++                const result = await processor.generate();
++                // onErrorStreaming emits through the application's asynchronous
++                // EventEmitter; let all existing extension listeners finish.
++                await new Promise(resolve => setTimeout(resolve, 0));
++                return {
++                    result, previews, events, finalizations, generatorClosed,
++                    text: st.chat[0].mes, reasoning: st.chat[0].extra.reasoning,
++                    domText: document.querySelector('#chat .mes_text').textContent,
++                    bold: document.querySelector('#chat .mes_text strong')?.textContent,
++                    stopped: processor.isStopped, aborted: processor.abortController.signal.aborted,
++                    finished: processor.isFinished,
++                };
++            } finally {
++                Date.now = originalNow;
++                if (hiddenDescriptor) Object.defineProperty(document, 'hidden', hiddenDescriptor);
++                else delete document.hidden;
++                for (const [event, handler] of handlers) st.eventSource.removeListener(event, handler);
++            }
++        }, scenario);
++
++        expect(result).toMatchObject({
++            result: '**Partial answer**', text: '**Partial answer**', reasoning: 'Partial reasoning',
++            domText: 'Partial answer', bold: 'Partial answer', stopped: true, aborted: true,
++            finished: false, finalizations: 0, generatorClosed: 1,
++        });
++        expect(result.previews).toEqual([{ id: 0, final: false }]);
++        expect(result.events).toEqual({ tokens: ['**Partial answer**'], received: [0], rendered: [0] });
++    });
++}

@@ -1,0 +1,322 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Thu, 22 Oct 2026 19:46:49 +0900
+Subject: [PATCH 10/31] Promote persisted character metadata into the bounded
+ memory cache
+
+---
+ src/endpoints/characters.js            |   4 +
+ tests/bench-character-list.mjs         | 132 +++++++++++++++++++++++++
+ tests/character-cache.node.mjs         |  84 ++++++++++++++++
+ tests/util/character-cache-fixture.mjs |  57 +++++++++++
+ 4 files changed, 277 insertions(+)
+ create mode 100644 tests/bench-character-list.mjs
+ create mode 100644 tests/character-cache.node.mjs
+ create mode 100644 tests/util/character-cache-fixture.mjs
+
+diff --git a/src/endpoints/characters.js b/src/endpoints/characters.js
+index 765160d0..59e921d8 100644
+--- a/src/endpoints/characters.js
++++ b/src/endpoints/characters.js
+@@ -188,6 +188,10 @@ async function readCharacterData(inputFile, inputFormat = 'png') {
+             const cache = await diskCache.instance();
+             const cachedData = await cache.getItem(cacheKey);
+             if (cachedData) {
++                // Populate the same bounded memory cache used by freshly parsed
++                // cards, so subsequent list/get requests do not reread the disk
++                // cache after every server restart. Android retains disk-only hits.
++                !isAndroid && memoryCache.set(cacheKey, cachedData);
+                 return cachedData;
+             }
+         } catch (error) {
+diff --git a/tests/bench-character-list.mjs b/tests/bench-character-list.mjs
+new file mode 100644
+index 00000000..ad1da62c
+--- /dev/null
++++ b/tests/bench-character-list.mjs
+@@ -0,0 +1,132 @@
++// Measure the real character-list HTTP route with an existing on-disk cache.
++// All cards and cache entries are temporary synthetic fixtures.
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++import { execFileSync } from 'node:child_process';
++import { performance } from 'node:perf_hooks';
++import { parseArgs } from 'node:util';
++import { fileURLToPath } from 'node:url';
++import { setConfigFilePath } from '../src/util.js';
++import { createCharacterCacheFixture, serveCharacterRouter } from './util/character-cache-fixture.mjs';
++
++const { values } = parseArgs({ options: {
++    baseline: { type: 'string', default: '78a22e873' },
++    rounds: { type: 'string', default: '5' },
++    count: { type: 'string', default: '200' },
++    'text-length': { type: 'string', default: '8192' },
++    help: { type: 'boolean', short: 'h' },
++} });
++if (values.help) {
++    console.log('Usage: node tests/bench-character-list.mjs [--baseline REF] [--rounds N] [--count N] [--text-length N]\n'
++        + 'Defaults: --baseline 78a22e873 --rounds 5 --count 200 --text-length 8192\n'
++        + 'Alternates baseline/current HTTP requests; reports wall time, CPU and cache-file reads.\n'
++        + 'Each round uses fresh card paths and an existing disk cache, with a 100 MB memory budget.\n'
++        + 'Uses current supporting modules and dependencies for both character endpoint versions.');
++    process.exit(0);
++}
++const rounds = Number(values.rounds);
++const count = Number(values.count);
++const textLength = Number(values['text-length']);
++if (![rounds, count, textLength].every(value => Number.isSafeInteger(value) && value > 0)) {
++    throw new Error('Rounds, count and text length must be positive integers.');
++}
++setConfigFilePath(fileURLToPath(new URL('../default/config.yaml', import.meta.url)));
++process.env.SILLYTAVERN_PERFORMANCE_USEDISKCACHE = 'true';
++process.env.SILLYTAVERN_PERFORMANCE_LAZYLOADCHARACTERS = 'false';
++process.env.SILLYTAVERN_PERFORMANCE_MEMORYCACHECAPACITY = '100mb';
++const endpoint = new URL('../src/endpoints/characters.js', import.meta.url);
++const gitOptions = { cwd: fileURLToPath(new URL('../', import.meta.url)), encoding: 'utf8' };
++const commit = execFileSync('git', ['rev-parse', '--verify', '--end-of-options', `${values.baseline}^{commit}`], gitOptions).trim();
++const source = execFileSync('git', ['show', `${commit}:src/endpoints/characters.js`], gitOptions);
++const resolvedSource = source.replace(/\bfrom\s+(['"])([^'"\r\n]+)\1(?=\s*;)/g, (_, quote, specifier) => {
++    const resolved = specifier.startsWith('.') || specifier.startsWith('/')
++        ? new URL(specifier, endpoint).href : import.meta.resolve(specifier);
++    return `from '${resolved}'`;
++});
++const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'st-bench-character-list-'));
++globalThis.DATA_ROOT = root;
++const implementations = {
++    baseline: await import('data:text/javascript;base64,' + Buffer.from(resolvedSource).toString('base64')),
++    current: await import(endpoint.href),
++};
++const caches = [];
++const samples = [];
++const originalReadFile = fs.readFile;
++let counters;
++fs.readFile = function (file, ...args) {
++    const sample = counters;
++    if (!sample || !String(file).startsWith(path.join(root, '_cache', 'characters') + path.sep)) {
++        return originalReadFile.call(this, file, ...args);
++    }
++    sample.diskCacheReads++;
++    const callback = args.pop();
++    args.push((error, data) => {
++        if (data) sample.diskCacheBytes += Buffer.byteLength(data);
++        callback(error, data);
++    });
++    return originalReadFile.call(this, file, ...args);
++};
++const rounded = value => +value.toFixed(2);
++const median = items => {
++    const sorted = [...items].sort((a, b) => a - b);
++    const middle = Math.floor(sorted.length / 2);
++    return rounded(sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2);
++};
++
++try {
++    // Complete initialization before counting actual HTTP reads.
++    for (const implementation of Object.values(implementations)) caches.push(await implementation.diskCache.instance());
++    for (let round = 0; round < rounds; round++) {
++        const fixture = await createCharacterCacheFixture(root, { count, textLength, user: `round-${round}` });
++        const order = round % 2 ? ['current', 'baseline'] : ['baseline', 'current'];
++        const sample = { round: round + 1, order };
++        let expected;
++        for (const name of order) {
++            const server = await serveCharacterRouter(implementations[name].router, fixture.directories);
++            try {
++                sample[name] = {};
++                for (const phase of ['first', 'repeated']) {
++                    counters = { diskCacheReads: 0, diskCacheBytes: 0 };
++                    const cpuStart = process.cpuUsage();
++                    const start = performance.now();
++                    const result = await server.request();
++                    const durationMs = performance.now() - start;
++                    const cpu = process.cpuUsage(cpuStart);
++                    sample[name][phase] = { durationMs: rounded(durationMs), cpuMs: rounded((cpu.user + cpu.system) / 1000), ...counters };
++                    counters = undefined;
++                    assert.equal(result.length, count);
++                    if (expected) assert.deepEqual(result, expected);
++                    else expected = result;
++                }
++            } finally {
++                await server.close();
++            }
++        }
++        samples.push(sample);
++    }
++    const summary = {};
++    for (const name of Object.keys(implementations)) {
++        summary[name] = {};
++        for (const phase of ['first', 'repeated']) {
++            const items = samples.map(sample => sample[name][phase]);
++            summary[name][phase] = {
++                medianMs: median(items.map(item => item.durationMs)),
++                medianCpuMs: median(items.map(item => item.cpuMs)),
++                minMs: Math.min(...items.map(item => item.durationMs)),
++                maxMs: Math.max(...items.map(item => item.durationMs)),
++                diskCacheReads: items.map(item => item.diskCacheReads),
++                diskCacheBytes: items.map(item => item.diskCacheBytes),
++            };
++        }
++    }
++    console.log(JSON.stringify({ baseline: commit, count, textLength, rounds, summary, samples,
++        note: 'Real localhost HTTP responses include JSON serialization and parsing. OS disk cache is not cleared; results vary with workload and machine load. First means a fresh application memory cache with existing disk-cache entries.',
++    }, null, 2));
++} finally {
++    fs.readFile = originalReadFile;
++    for (const implementation of Object.values(implementations)) implementation.diskCache.dispose();
++    for (const cache of caches) cache.stopWriteQueueInterval();
++    await fs.promises.rm(root, { recursive: true, force: true });
++}
+diff --git a/tests/character-cache.node.mjs b/tests/character-cache.node.mjs
+new file mode 100644
+index 00000000..a097a097
+--- /dev/null
++++ b/tests/character-cache.node.mjs
+@@ -0,0 +1,84 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++import fs from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++import { createCharacterCacheFixture, serveCharacterRouter } from './util/character-cache-fixture.mjs';
++import { write } from '../src/character-card-parser.js';
++import { setConfigFilePath } from '../src/util.js';
++
++setConfigFilePath(fileURLToPath(new URL('../default/config.yaml', import.meta.url)));
++process.env.SILLYTAVERN_PERFORMANCE_USEDISKCACHE = 'true';
++process.env.SILLYTAVERN_PERFORMANCE_LAZYLOADCHARACTERS = 'false';
++
++async function setup(t, options = {}, capacity = '100mb') {
++    const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'st-character-cache-'));
++    globalThis.DATA_ROOT = root;
++    process.env.SILLYTAVERN_PERFORMANCE_MEMORYCACHECAPACITY = capacity;
++    const fixture = await createCharacterCacheFixture(root, options);
++    const module = await import(`../src/endpoints/characters.js?cache-test=${encodeURIComponent(root)}`);
++    const server = await serveCharacterRouter(module.router, fixture.directories);
++    const cache = await module.diskCache.instance();
++    const originalReadFile = fs.readFile;
++    let cacheReads = 0;
++    t.mock.method(fs, 'readFile', function (file, ...args) {
++        if (String(file).startsWith(fixture.cacheDirectory + path.sep)) cacheReads++;
++        return originalReadFile.call(this, file, ...args);
++    });
++    t.after(async () => {
++        await server.close();
++        module.diskCache.dispose();
++        cache.stopWriteQueueInterval();
++        await fs.promises.rm(root, { recursive: true, force: true });
++    });
++    return { ...fixture, root, server, reads: () => cacheReads };
++}
++
++test('persisted character metadata is reused in memory after its first HTTP read', async t => {
++    const fixture = await setup(t, { count: 3 });
++    const first = await fixture.server.request();
++    assert.equal(first.length, 3);
++    assert.equal(fixture.reads(), 3);
++    const second = await fixture.server.request();
++    assert.deepEqual(second, first);
++    assert.equal(fixture.reads(), 3, 'unchanged cards must not reread their disk-cache entries');
++    const selected = await fixture.server.request('/get', { avatar_url: 'card-1.png' });
++    assert.equal(selected.name, 'test-user 1');
++    assert.equal(selected.description, fixture.cards[1].card.data.description);
++    assert.equal(fixture.reads(), 3);
++});
++
++test('editing a cached card invalidates the promoted metadata', async t => {
++    const fixture = await setup(t);
++    assert.equal((await fixture.server.request())[0].name, 'test-user 0');
++    const card = fixture.cards[0];
++    card.card.name = card.card.data.name = 'Updated character';
++    await fs.promises.writeFile(card.file, write(await fs.promises.readFile(card.file), JSON.stringify(card.card)));
++    const updatedTime = new Date(Date.now() + 1000);
++    await fs.promises.utimes(card.file, updatedTime, updatedTime);
++    const updated = await fixture.server.request('/get', { avatar_url: 'card-0.png' });
++    assert.equal(updated.name, 'Updated character');
++    assert.equal((await fixture.server.request())[0].name, 'Updated character');
++});
++
++test('equal avatar filenames in separate user directories retain separate metadata', async t => {
++    const fixture = await setup(t);
++    const other = await createCharacterCacheFixture(fixture.root, { user: 'another-user' });
++    const module = await import(`../src/endpoints/characters.js?cache-test=${encodeURIComponent(fixture.root)}`);
++    const server = await serveCharacterRouter(module.router, other.directories);
++    t.after(() => server.close());
++    assert.equal((await fixture.server.request())[0].name, 'test-user 0');
++    assert.equal((await server.request())[0].name, 'another-user 0');
++    assert.equal((await fixture.server.request())[0].name, 'test-user 0');
++});
++
++for (const [capacity, textLength] of [['0', 1024], ['1kb', 2048]]) {
++    test(`disk hits respect the ${capacity} memory budget`, async t => {
++        const fixture = await setup(t, { textLength }, capacity);
++        const first = await fixture.server.request();
++        assert.equal(first[0].description.length, textLength);
++        assert.deepEqual(await fixture.server.request(), first);
++        assert.equal(fixture.reads(), 2, 'disabled or oversized memory entries must remain disk-backed');
++    });
++}
+diff --git a/tests/util/character-cache-fixture.mjs b/tests/util/character-cache-fixture.mjs
+new file mode 100644
+index 00000000..be013dca
+--- /dev/null
++++ b/tests/util/character-cache-fixture.mjs
+@@ -0,0 +1,57 @@
++import fs from 'node:fs/promises';
++import path from 'node:path';
++import { createHash } from 'node:crypto';
++import express from 'express';
++import { read, write } from '../../src/character-card-parser.js';
++
++export async function createCharacterCacheFixture(root, { count = 1, textLength = 1024, user = 'test-user' } = {}) {
++    const directories = Object.fromEntries(['characters', 'chats', 'worlds'].map(name => [name, path.join(root, user, name)]));
++    await Promise.all(Object.values(directories).map(directory => fs.mkdir(directory, { recursive: true })));
++    const cacheDirectory = path.join(root, '_cache', 'characters');
++    await fs.mkdir(cacheDirectory, { recursive: true });
++    const avatar = await fs.readFile(new URL('../../public/img/ai4.png', import.meta.url));
++    const cards = [];
++    for (let index = 0; index < count; index++) {
++        const name = `${user} ${index}`;
++        const data = {
++            name, description: 'x'.repeat(textLength), personality: '', scenario: '', first_mes: 'Hello', mes_example: '',
++            creator_notes: '', system_prompt: '', post_history_instructions: '', alternate_greetings: [],
++            tags: ['fixture'], creator: '', character_version: '', extensions: { fav: false, talkativeness: 0.5 },
++        };
++        const card = { spec: 'chara_card_v2', spec_version: '2.0', name, chat: 'fixture-chat', create_date: '2026-01-01T00:00:00.000Z', data };
++        const file = path.join(directories.characters, `card-${index}.png`);
++        const png = write(avatar, JSON.stringify(card));
++        // Seed exactly what the normal PNG parser would persist, including the
++        // preferred ccv3 chunk emitted by the card writer.
++        const serialized = read(png);
++        await fs.writeFile(file, png);
++        const key = `${file}-${(await fs.stat(file)).mtimeMs}`;
++        const cachedFile = path.join(cacheDirectory, createHash('sha256').update(key).digest('hex'));
++        await fs.writeFile(cachedFile, JSON.stringify({ key, value: serialized }));
++        cards.push({ file, cachedFile, card, serialized });
++    }
++    return { directories, cards, cacheDirectory };
++}
++
++export async function serveCharacterRouter(router, directories) {
++    const app = express();
++    app.use(express.json());
++    app.use((request, response, next) => {
++        request.user = { profile: { handle: 'test-user' }, directories };
++        next();
++    });
++    app.use('/api/characters', router);
++    const server = app.listen(0, '127.0.0.1');
++    await new Promise(resolve => server.once('listening', resolve));
++    const origin = `http://127.0.0.1:${server.address().port}`;
++    return {
++        async request(route = '/all', body = {}) {
++            const response = await fetch(`${origin}/api/characters${route}`, {
++                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
++            });
++            if (!response.ok) throw new Error(`Character request failed: ${response.status}`);
++            return response.json();
++        },
++        close: () => new Promise(resolve => server.close(resolve)),
++    };
++}
